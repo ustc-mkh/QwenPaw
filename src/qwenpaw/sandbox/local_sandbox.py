@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Local sandbox — macOS Seatbelt + None mode.
+"""Local sandbox — macOS Seatbelt + None mode + factory.
 
-Only two modes are implemented:
+Modes implemented here:
   - SEATBELT: macOS sandbox-exec kernel isolation
   - NONE: passthrough, no isolation (trusted scenarios)
+
+Additional modes dispatched by the factory (create_sandbox):
+  - LANDLOCK:     Linux Landlock LSM (linux_sandbox.py)
+  - WSL2:         Windows WSL2 + Landlock (windows_sandbox.py)
+  - APPCONTAINER: Windows native AppContainer (windows_native_sandbox.py)
 
 Usage:
     from qwenpaw.sandbox import (
@@ -351,9 +356,8 @@ class MacOSSandbox(LocalSandbox):
             # shapes so legitimate application output containing
             # tokens like "deny" or "sandbox" is not mis-flagged.
             violation = None
-            if (
-                self._process.returncode != 0
-                and _SEATBELT_VIOLATION_RE.search(stderr)
+            if self._process.returncode != 0 and _SEATBELT_VIOLATION_RE.search(
+                stderr
             ):
                 violation = stderr.strip()
 
@@ -464,12 +468,11 @@ def create_sandbox(config: SandboxConfig) -> Any:
     """Create a sandbox instance based on ``config.mode``.
 
     Supported modes:
-      - SEATBELT → MacOSSandbox
-      - LANDLOCK → LinuxSandbox
-      - NONE     → NoneSandbox
-      - WSL2     → WindowsSandbox (currently disabled at probe time;
-                   Re-enable in ``probe_sandbox_support`` when the
-                   Windows sandbox path is production-ready.)
+      - SEATBELT     → MacOSSandbox
+      - LANDLOCK     → LinuxSandbox
+      - NONE         → NoneSandbox
+      - WSL2         → WindowsSandbox (WSL2 + Landlock delegation)
+      - APPCONTAINER → WindowsNativeSandbox (native Win8+ AppContainer)
     """
     if config.mode == SandboxMode.SEATBELT:
         return MacOSSandbox(config)
@@ -483,5 +486,9 @@ def create_sandbox(config: SandboxConfig) -> Any:
         from .windows_sandbox import WindowsSandbox
 
         return WindowsSandbox(config)
+    elif config.mode == SandboxMode.APPCONTAINER:
+        from .windows_native_sandbox import WindowsNativeSandbox
+
+        return WindowsNativeSandbox(config)
     else:
         raise ValueError(f"Unknown sandbox mode: {config.mode}")

@@ -12,8 +12,9 @@ class SandboxMode(str, Enum):
     """Sandbox isolation mode."""
 
     SEATBELT = "seatbelt"  # macOS sandbox-exec
-    LANDLOCK = "landlock"  # Linux (future)
-    WSL2 = "wsl2"  # Windows (future)
+    LANDLOCK = "landlock"  # Linux Landlock LSM (kernel 5.13+)
+    WSL2 = "wsl2"  # Windows WSL2 delegated execution + Landlock
+    APPCONTAINER = "appcontainer"  # Windows native AppContainer (Win8+)
     NONE = "none"  # No isolation, direct execution
 
 
@@ -125,9 +126,7 @@ class SandboxCapability:
     )
 
 
-def _probe_linux_landlock() -> (
-    SandboxCapability
-):  # pylint: disable=too-many-return-statements
+def _probe_linux_landlock() -> SandboxCapability:  # pylint: disable=too-many-return-statements
     """Probe Linux Landlock support.
 
     Detection steps:
@@ -135,9 +134,9 @@ def _probe_linux_landlock() -> (
         2. /sys/kernel/security/lsm contains "landlock"
         3. Attempt landlock_create_ruleset syscall to detect ABI version
     """
-    import os
     import ctypes
     import ctypes.util
+    import os
 
     # Step 1: Check kernel version
     try:
@@ -226,8 +225,7 @@ def _probe_linux_landlock() -> (
                 supported=False,
                 mode=SandboxMode.NONE,
                 reason=(
-                    f"landlock_create_ruleset syscall failed, "
-                    f"errno={errno}"
+                    f"landlock_create_ruleset syscall failed, errno={errno}"
                 ),
             )
 
@@ -315,6 +313,37 @@ def _probe_windows_wsl2() -> SandboxCapability:
     )
 
 
+def _probe_windows_appcontainer() -> SandboxCapability:
+    """Probe native Windows AppContainer sandbox support.
+
+    Detection steps:
+        1. Platform is win32
+        2. AppContainer APIs are available (Win8+ / Server 2012+)
+        3. Can create and delete a test AppContainer profile
+    """
+    try:
+        from .windows_native_sandbox import probe_windows_native
+    except ImportError as e:
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason=f"Failed to import windows_native_sandbox module: {e}",
+        )
+
+    available, reason = probe_windows_native()
+    if available:
+        return SandboxCapability(
+            supported=True,
+            mode=SandboxMode.APPCONTAINER,
+            reason=reason,
+        )
+    return SandboxCapability(
+        supported=False,
+        mode=SandboxMode.NONE,
+        reason=reason,
+    )
+
+
 def probe_sandbox_support() -> SandboxCapability:
     """Probe current platform sandbox support at startup.
 
@@ -329,15 +358,20 @@ def probe_sandbox_support() -> SandboxCapability:
     elif sys.platform == "linux":
         return _probe_linux_landlock()
     elif sys.platform == "win32":
-        # Windows sandbox (WSL2 + Landlock) is currently disabled because the
-        # WSL2 delegation path is not production-ready. Re-enable by calling
-        # ``_probe_windows_wsl2()`` once the Windows sandbox path is ready.
+        # Try native AppContainer first (preferred: no WSL dependency)
+        cap = _probe_windows_appcontainer()
+        if cap.supported:
+            return cap
+        # Fallback: WSL2 + Landlock delegation
+        cap = _probe_windows_wsl2()
+        if cap.supported:
+            return cap
         return SandboxCapability(
             supported=False,
             mode=SandboxMode.NONE,
             reason=(
-                "Windows sandbox temporarily disabled until "
-                "WSL2 path is ready"
+                "Windows sandbox unavailable: "
+                "AppContainer and WSL2+Landlock both unsupported"
             ),
         )
     else:

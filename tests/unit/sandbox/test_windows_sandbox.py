@@ -338,17 +338,98 @@ class TestFactoryWSL2:
 
 
 class TestConfigProbeWindows:
-    """Test probe_sandbox_support disables Windows sandbox at probe time."""
+    """Test probe_sandbox_support on Windows tries AppContainer then WSL2."""
 
     @patch("sys.platform", "win32")
     @patch("qwenpaw.sandbox.config._probe_windows_wsl2")
-    def test_windows_disabled_returns_none(self, mock_probe):
-        from qwenpaw.sandbox.config import probe_sandbox_support
+    @patch("qwenpaw.sandbox.config._probe_windows_appcontainer")
+    def test_appcontainer_available_returns_appcontainer(
+        self, mock_ac_probe, mock_wsl_probe
+    ):
+        from qwenpaw.sandbox.config import (
+            SandboxCapability,
+            probe_sandbox_support,
+        )
 
-        # Windows sandbox is currently disabled at probe time — it should
-        # NOT call ``_probe_windows_wsl2`` and should return ``mode=NONE``.
+        mock_ac_probe.return_value = SandboxCapability(
+            supported=True,
+            mode=SandboxMode.APPCONTAINER,
+            reason="AppContainer available",
+        )
+        result = probe_sandbox_support()
+        assert result.supported is True
+        assert result.mode == SandboxMode.APPCONTAINER
+        mock_wsl_probe.assert_not_called()
+
+    @patch("sys.platform", "win32")
+    @patch("qwenpaw.sandbox.config._probe_windows_wsl2")
+    @patch("qwenpaw.sandbox.config._probe_windows_appcontainer")
+    def test_appcontainer_unavailable_falls_back_to_wsl2(
+        self, mock_ac_probe, mock_wsl_probe
+    ):
+        from qwenpaw.sandbox.config import (
+            SandboxCapability,
+            probe_sandbox_support,
+        )
+
+        mock_ac_probe.return_value = SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason="AppContainer not available",
+        )
+        mock_wsl_probe.return_value = SandboxCapability(
+            supported=True,
+            mode=SandboxMode.WSL2,
+            reason="WSL2 distro 'Ubuntu' with Landlock ABI v3",
+            landlock_abi_version=3,
+        )
+        result = probe_sandbox_support()
+        assert result.supported is True
+        assert result.mode == SandboxMode.WSL2
+        mock_wsl_probe.assert_called_once()
+
+    @patch("sys.platform", "win32")
+    @patch("qwenpaw.sandbox.config._probe_windows_wsl2")
+    @patch("qwenpaw.sandbox.config._probe_windows_appcontainer")
+    def test_both_unavailable_returns_none(
+        self, mock_ac_probe, mock_wsl_probe
+    ):
+        from qwenpaw.sandbox.config import (
+            SandboxCapability,
+            probe_sandbox_support,
+        )
+
+        mock_ac_probe.return_value = SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason="AppContainer not available",
+        )
+        mock_wsl_probe.return_value = SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason="WSL2 unavailable",
+        )
         result = probe_sandbox_support()
         assert result.supported is False
         assert result.mode == SandboxMode.NONE
-        assert "disabled" in result.reason.lower()
-        mock_probe.assert_not_called()
+        assert "unavailable" in result.reason.lower()
+
+
+# ============================================================================
+# Factory integration test (AppContainer)
+# ============================================================================
+
+
+class TestFactoryAppContainer:
+    """Test that create_sandbox correctly routes to WindowsNativeSandbox."""
+
+    def test_create_sandbox_appcontainer(self):
+        from qwenpaw.sandbox import create_sandbox
+        from qwenpaw.sandbox.windows_native_sandbox import WindowsNativeSandbox
+
+        config = SandboxConfig(
+            mode=SandboxMode.APPCONTAINER,
+            workspace_dir="C:\\Users\\foo\\project",
+        )
+        sandbox = create_sandbox(config)
+        assert isinstance(sandbox, WindowsNativeSandbox)
