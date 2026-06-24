@@ -557,6 +557,9 @@ def _build_acl_rules(
     if config.allow_read_all:
         for root in _enumerate_drive_roots():
             _add_grant(root, "ReadAndExecute")
+    else:
+        for root in _enumerate_drive_roots():
+            _add_grant(root, "Traverse")
 
     # 4. Mounts
     for mount in config.mounts:
@@ -588,18 +591,22 @@ def _psid_to_string(sid: ctypes.c_void_p) -> str:
 
 
 def _icacls_grant(path: str, sid_string: str, access_level: str) -> None:
-    """Grant an inheritable Allow ACE for a SID on a filesystem path
-    using icacls.
+    """Grant an Allow ACE for a SID on a filesystem path using icacls.
 
     Args:
         path: Filesystem path to modify.
         sid_string: SID string (e.g. "S-1-15-2-...").
-        access_level: "FullControl", "Modify", or "ReadAndExecute".
+        access_level: "FullControl", "Modify", "ReadAndExecute" (inheritable),
+            or "Traverse" (inheritable X from drive root for traversal).
     """
     if access_level == "FullControl":
         perm = f"*{sid_string}:(OI)(CI)F"
     elif access_level == "Modify":
         perm = f"*{sid_string}:(OI)(CI)M"
+    elif access_level == "Traverse":
+        # Inheritable Execute/Traverse from a drive root: allows
+        # SetCurrentDirectory to traverse the path chain.
+        perm = f"*{sid_string}:(OI)(CI)(X)"
     else:
         perm = f"*{sid_string}:(OI)(CI)RX"
 
@@ -706,6 +713,9 @@ def _icacls_batch_grant(
             perm_suffix = "(OI)(CI)F"
         elif level == "Modify":
             perm_suffix = "(OI)(CI)M"
+        elif level == "Traverse":
+            # Inheritable Execute/Traverse from a drive root.
+            perm_suffix = "(OI)(CI)(X)"
         else:
             perm_suffix = "(OI)(CI)RX"
 
@@ -1258,19 +1268,38 @@ def _read_pipe(handle: ctypes.c_void_p) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _build_powershell_command_line(cmd: str) -> str:
+def _build_powershell_command_line(cmd: str, cwd: Optional[str] = None) -> str:
     """Build a PowerShell command line using -EncodedCommand.
 
     Wraps the user command in a script that:
       1. Suppresses progress bar output ($ProgressPreference)
-      2. Executes the user command
-      3. Propagates the exit code — uses $LASTEXITCODE for external programs,
+      2. Sets the working directory (AppContainer processes cannot rely on
+         CreateProcessW's lpCurrentDirectory because the cwd path may not be
+         accessible at process-creation time before ACLs take effect)
+      3. Executes the user command
+      4. Propagates the exit code — uses $LASTEXITCODE for external programs,
          falls back to $? (cmdlet success indicator) when $LASTEXITCODE is null
+
+    Args:
+        cmd: The user command to execute.
+        cwd: Working directory path. If provided, a Set-Location is injected
+             at the start of the script to ensure the process runs in the
+             correct directory.
 
     Returns a full command line string suitable for CreateProcessW.
     """
+    # Build the Set-Location prefix if cwd is provided.
+    # Use single-quoted literal path to avoid PowerShell interpolation.
+    # Escape embedded single quotes by doubling them.
+    if cwd:
+        escaped_cwd = cwd.replace("'", "''")
+        set_location = f"Set-Location -LiteralPath '{escaped_cwd}'\n"
+    else:
+        set_location = ""
+
     script = (
         "$ProgressPreference = 'SilentlyContinue'\n"
+        f"{set_location}"
         f"{cmd}\n"
         "if ($? -eq $false) {\n"
         "  $__qwenpaw_code = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }\n"
@@ -1421,7 +1450,7 @@ def _launch_in_appcontainer_sync(
         si_ex.lpAttributeList = attr_list
 
         # 6. Build command line and environment block
-        cmd_line = _build_powershell_command_line(cmd)
+        cmd_line = _build_powershell_command_line(cmd, cwd=cwd)
         env_block = _build_env_block(env_vars)
         creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW
         if env_block is not None:
