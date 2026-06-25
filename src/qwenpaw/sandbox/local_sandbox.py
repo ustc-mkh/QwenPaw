@@ -6,9 +6,8 @@ Modes implemented here:
   - NONE: passthrough, no isolation (trusted scenarios)
 
 Additional modes dispatched by the factory (create_sandbox):
-  - LANDLOCK:     Linux Landlock LSM (linux_sandbox.py)
-  - WSL2:         Windows WSL2 + Landlock (windows_sandbox.py)
-  - APPCONTAINER: Windows native AppContainer (windows_native_sandbox.py)
+  - LANDLOCK: Linux Landlock LSM (linux_sandbox.py)
+  - HOOK:     Windows user-mode API hook (windows_hook_sandbox.py)
 
 Usage:
     from qwenpaw.sandbox import (
@@ -468,11 +467,10 @@ def create_sandbox(config: SandboxConfig) -> Any:
     """Create a sandbox instance based on ``config.mode``.
 
     Supported modes:
-      - SEATBELT     → MacOSSandbox
-      - LANDLOCK     → LinuxSandbox
-      - NONE         → NoneSandbox
-      - WSL2         → WindowsSandbox (WSL2 + Landlock delegation)
-      - APPCONTAINER → WindowsNativeSandbox (native Win8+ AppContainer)
+      - SEATBELT → MacOSSandbox
+      - LANDLOCK → LinuxSandbox
+      - HOOK     → WindowsHookSandbox
+      - NONE     → NoneSandbox
     """
     if config.mode == SandboxMode.SEATBELT:
         return MacOSSandbox(config)
@@ -482,14 +480,6 @@ def create_sandbox(config: SandboxConfig) -> Any:
         from .linux_sandbox import LinuxSandbox
 
         return LinuxSandbox(config)
-    elif config.mode == SandboxMode.WSL2:
-        from .windows_sandbox import WindowsSandbox
-
-        return WindowsSandbox(config)
-    elif config.mode == SandboxMode.APPCONTAINER:
-        from .windows_native_sandbox import WindowsNativeSandbox
-
-        return WindowsNativeSandbox(config)
     elif config.mode == SandboxMode.HOOK:
         from .windows_hook_sandbox import WindowsHookSandbox
 

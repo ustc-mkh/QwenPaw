@@ -37,17 +37,3 @@ set_target_properties(sandbox_hook PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
-
-# Test harness executable
-add_executable(test_hook test_hook.c sandbox_hook.h)
-target_link_libraries(test_hook PRIVATE kernel32)
-
-if(MSVC)
-    target_compile_options(test_hook PRIVATE /O2 /utf-8)
-    set_property(TARGET test_hook PROPERTY
-        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-endif()
-
-set_target_properties(test_hook PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
-)

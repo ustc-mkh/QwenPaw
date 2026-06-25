@@ -2,11 +2,10 @@
 """Sandbox — lightweight local execution isolation.
 
 Supported modes:
-  - SEATBELT:     macOS sandbox-exec kernel isolation
-  - LANDLOCK:     Linux Landlock LSM kernel isolation (5.13+)
-  - WSL2:         Windows WSL2 delegated execution + Landlock isolation
-  - APPCONTAINER: Windows native AppContainer kernel isolation (Win8+)
-  - NONE:         no isolation, direct execution
+  - SEATBELT: macOS sandbox-exec kernel isolation
+  - LANDLOCK: Linux Landlock LSM kernel isolation (5.13+)
+  - HOOK:     Windows user-mode API hook (DLL injection)
+  - NONE:     no isolation, direct execution
 
 Lifecycle: per-tool-call (created and destroyed for each invocation).
 
@@ -42,8 +41,6 @@ from .local_sandbox import (
     create_sandbox,
 )
 from .windows_hook_sandbox import WindowsHookSandbox
-from .windows_native_sandbox import WindowsNativeSandbox
-from .windows_sandbox import WindowsSandbox
 
 __all__ = [
     "ExecutionResult",
@@ -56,8 +53,6 @@ __all__ = [
     "SandboxConfig",
     "SandboxMode",
     "WindowsHookSandbox",
-    "WindowsNativeSandbox",
-    "WindowsSandbox",
     "create_sandbox",
     "detect_platform_mode",
     "probe_sandbox_support",

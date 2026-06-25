@@ -13,9 +13,7 @@ class SandboxMode(str, Enum):
 
     SEATBELT = "seatbelt"  # macOS sandbox-exec
     LANDLOCK = "landlock"  # Linux Landlock LSM (kernel 5.13+)
-    WSL2 = "wsl2"  # Windows WSL2 delegated execution + Landlock
-    APPCONTAINER = "appcontainer"  # Windows native AppContainer (Win8+)
-    HOOK = "hook"  # Windows user-mode API hook (Detours DLL)
+    HOOK = "hook"  # Windows user-mode API hook (DLL injection)
     NONE = "none"  # No isolation, direct execution
 
 
@@ -261,59 +259,6 @@ def _probe_macos_seatbelt() -> SandboxCapability:
     )
 
 
-def _probe_windows_wsl2() -> SandboxCapability:
-    """Probe Windows WSL2 + Landlock support.
-
-    Detection steps:
-        1. wsl.exe is available
-        2. A WSL2 distribution exists
-        3. python3 is available inside the WSL2 distribution
-        4. The WSL2 distribution kernel supports Landlock
-    """
-    try:
-        from .windows_sandbox import (
-            check_wsl_landlock,
-            check_wsl_python3,
-            probe_wsl2_availability,
-        )
-    except ImportError as e:
-        return SandboxCapability(
-            supported=False,
-            mode=SandboxMode.NONE,
-            reason=f"Failed to import windows_sandbox module: {e}",
-        )
-
-    available, distro, reason = probe_wsl2_availability()
-    if not available:
-        return SandboxCapability(
-            supported=False,
-            mode=SandboxMode.NONE,
-            reason=f"WSL2 unavailable: {reason}",
-        )
-
-    if not check_wsl_python3(distro):
-        return SandboxCapability(
-            supported=False,
-            mode=SandboxMode.NONE,
-            reason=f"python3 not found in WSL2 distro '{distro}'",
-        )
-
-    supported, abi_version = check_wsl_landlock(distro)
-    if not supported:
-        return SandboxCapability(
-            supported=False,
-            mode=SandboxMode.NONE,
-            reason=f"Landlock not supported in WSL2 distro '{distro}' kernel",
-        )
-
-    return SandboxCapability(
-        supported=True,
-        mode=SandboxMode.WSL2,
-        reason=f"WSL2 distro '{distro}' with Landlock ABI v{abi_version}",
-        landlock_abi_version=abi_version,
-    )
-
-
 def _probe_windows_hook() -> SandboxCapability:
     """Probe Windows hook sandbox support (Detours DLL available).
 
@@ -345,37 +290,6 @@ def _probe_windows_hook() -> SandboxCapability:
     )
 
 
-def _probe_windows_appcontainer() -> SandboxCapability:
-    """Probe native Windows AppContainer sandbox support.
-
-    Detection steps:
-        1. Platform is win32
-        2. AppContainer APIs are available (Win8+ / Server 2012+)
-        3. Can create and delete a test AppContainer profile
-    """
-    try:
-        from .windows_native_sandbox import probe_windows_native
-    except ImportError as e:
-        return SandboxCapability(
-            supported=False,
-            mode=SandboxMode.NONE,
-            reason=f"Failed to import windows_native_sandbox module: {e}",
-        )
-
-    available, reason = probe_windows_native()
-    if available:
-        return SandboxCapability(
-            supported=True,
-            mode=SandboxMode.APPCONTAINER,
-            reason=reason,
-        )
-    return SandboxCapability(
-        supported=False,
-        mode=SandboxMode.NONE,
-        reason=reason,
-    )
-
-
 def probe_sandbox_support() -> SandboxCapability:
     """Probe current platform sandbox support at startup.
 
@@ -390,25 +304,14 @@ def probe_sandbox_support() -> SandboxCapability:
     elif sys.platform == "linux":
         return _probe_linux_landlock()
     elif sys.platform == "win32":
-        # Try Hook sandbox first (fastest: no ACL modifications)
+        # Windows uses hook-based sandbox (DLL injection)
         cap = _probe_windows_hook()
-        if cap.supported:
-            return cap
-        # Fallback: native AppContainer (no WSL dependency)
-        cap = _probe_windows_appcontainer()
-        if cap.supported:
-            return cap
-        # Fallback: WSL2 + Landlock delegation
-        cap = _probe_windows_wsl2()
         if cap.supported:
             return cap
         return SandboxCapability(
             supported=False,
             mode=SandboxMode.NONE,
-            reason=(
-                "Windows sandbox unavailable: "
-                "Hook, AppContainer and WSL2+Landlock all unsupported"
-            ),
+            reason="Windows hook sandbox unavailable",
         )
     else:
         return SandboxCapability(
