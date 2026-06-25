@@ -81,7 +81,7 @@ typedef struct _VIOLATION_ENTRY {
 
 #define WRITE_INTENT_MASK   (FILE_WRITE_DATA | FILE_APPEND_DATA | \
                              FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | \
-                             DELETE | FILE_DELETE_CHILD | GENERIC_WRITE)
+                             GENERIC_WRITE)
 
 #define EXEC_INTENT_MASK    (FILE_EXECUTE | GENERIC_EXECUTE)
 #define DELETE_INTENT_MASK   (DELETE | FILE_DELETE_CHILD)

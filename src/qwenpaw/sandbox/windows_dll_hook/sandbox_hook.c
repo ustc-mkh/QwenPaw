@@ -484,17 +484,24 @@ static void log_violation(const WCHAR* path, int path_len, WORD access_type) {
 
     if (entry_size > log_size) return;
 
-    /* Get write position (simple atomic) */
-    DWORD write_pos = InterlockedCompareExchange(
-        (volatile LONG*)&hdr->violation_write_pos, 0, 0);
-    write_pos = write_pos % log_size;
+    /* Atomically reserve space in the ring buffer using a CAS loop.
+     * This prevents the race condition where two threads read the same
+     * write_pos and overwrite each other's entries. */
+    LONG old_pos, new_pos;
+    do {
+        old_pos = InterlockedCompareExchange(
+            (volatile LONG*)&hdr->violation_write_pos, 0, 0);
+        new_pos = old_pos % (LONG)log_size;
+        if ((DWORD)new_pos + entry_size > log_size) {
+            new_pos = 0;
+        }
+    } while (InterlockedCompareExchange(
+                 (volatile LONG*)&hdr->violation_write_pos,
+                 new_pos + (LONG)entry_size,
+                 old_pos) != old_pos);
 
-    if (write_pos + entry_size > log_size) {
-        write_pos = 0;
-    }
-
-    /* Build entry */
-    BYTE* base = (BYTE*)g_shm_view + log_offset + write_pos;
+    /* Build entry at reserved position */
+    BYTE* base = (BYTE*)g_shm_view + log_offset + new_pos;
     VIOLATION_ENTRY* entry = (VIOLATION_ENTRY*)base;
     entry->total_size = entry_size;
     entry->timestamp = GetTickCount();
@@ -505,9 +512,7 @@ static void log_violation(const WCHAR* path, int path_len, WORD access_type) {
 
     memcpy(base + VIOLATION_ENTRY_HDR_SIZE, path, path_bytes);
 
-    /* Update write position and count */
-    InterlockedExchange((volatile LONG*)&hdr->violation_write_pos,
-                        (LONG)(write_pos + entry_size));
+    /* Increment violation count */
     InterlockedIncrement((volatile LONG*)&hdr->violation_count);
 }
 
@@ -518,16 +523,25 @@ static void log_violation(const WCHAR* path, int path_len, WORD access_type) {
 /**
  * Minimal x64 instruction length decoder for function prologues.
  * Returns length of instruction at code[0], or 0 if unknown.
+ *
+ * Also detects RIP-relative addressing via the is_rip_relative out param.
+ * Callers must handle RIP-relative instructions specially when relocating.
  */
-static int x64_insn_length(const BYTE* code) {
+static int x64_insn_length(const BYTE* code, BOOL* is_rip_relative) {
     const BYTE* p = code;
-    BOOL has_rex = FALSE;
     BOOL rex_w = FALSE;
+    *is_rip_relative = FALSE;
+
+    /* Handle ENDBR64: F3 0F 1E FA (Intel CET) */
+    if (p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x1E && p[3] == 0xFA) {
+        return 4;
+    }
 
     /* Skip prefixes */
     while (1) {
-        if (*p >= 0x40 && *p <= 0x4F) { has_rex = TRUE; rex_w = (*p & 0x08) != 0; p++; }
+        if (*p >= 0x40 && *p <= 0x4F) { rex_w = (*p & 0x08) != 0; p++; }
         else if (*p == 0x66 || *p == 0x67) { p++; }
+        else if (*p == 0xF3 || *p == 0xF2) { p++; }  /* REP/REPNE prefix */
         else break;
     }
 
@@ -550,6 +564,7 @@ static int x64_insn_length(const BYTE* code) {
     if (opcode == 0x0F) {
         BYTE op2 = *p++;
         if (op2 == 0x05) return (int)(p - code);  /* SYSCALL */
+        if (op2 == 0x1E) { p++; return (int)(p - code); }  /* ENDBR32/64 (0F 1E xx) */
         if (op2 >= 0x80 && op2 <= 0x8F) return (int)(p - code) + 4;  /* Jcc near */
         return 0;
     }
@@ -576,7 +591,10 @@ static int x64_insn_length(const BYTE* code) {
         if (mod != 3 && rm == 4) p++;  /* SIB byte */
         if (mod == 1) p += 1;          /* disp8 */
         else if (mod == 2) p += 4;     /* disp32 */
-        else if (mod == 0 && rm == 5) p += 4; /* RIP-rel disp32 */
+        else if (mod == 0 && rm == 5) {
+            p += 4; /* RIP-rel disp32 */
+            *is_rip_relative = TRUE;
+        }
 
         /* Immediate for group opcodes */
         if (is_group) {
@@ -597,12 +615,19 @@ static int x64_insn_length(const BYTE* code) {
 
 /**
  * Calculate minimum bytes to copy for trampoline (instruction-aligned >= 5).
+ * Returns 0 if the prologue contains RIP-relative instructions (which cannot
+ * be safely relocated without fixups) or unknown instructions.
  */
 static int calc_trampoline_copy_size(const BYTE* code) {
     int total = 0;
     while (total < 5) {
-        int len = x64_insn_length(code + total);
+        BOOL is_rip_relative = FALSE;
+        int len = x64_insn_length(code + total, &is_rip_relative);
         if (len == 0) return 0;
+        if (is_rip_relative) {
+            DBG("RIP-relative instruction at offset %d, cannot relocate", total);
+            return 0;
+        }
         total += len;
     }
     return total;
@@ -784,10 +809,67 @@ static NTSTATUS NTAPI hooked_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes)
 }
 
 /**
+ * Check if a file handle corresponds to a path with write permission.
+ * Uses GetFinalPathNameByHandleW to resolve the handle to a path, then
+ * checks the path against the policy.
+ */
+static BOOL is_handle_in_writable_dir(HANDLE hFile) {
+    typedef DWORD (WINAPI *PFN_GetFinalPathNameByHandleW)(
+        HANDLE, LPWSTR, DWORD, DWORD);
+    static PFN_GetFinalPathNameByHandleW pfn = NULL;
+    static BOOL resolved = FALSE;
+
+    if (!resolved) {
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            pfn = (PFN_GetFinalPathNameByHandleW)GetProcAddress(
+                hKernel32, "GetFinalPathNameByHandleW");
+        }
+        resolved = TRUE;
+    }
+    if (!pfn) return FALSE;
+
+    WCHAR path_buf[MAX_PATH_LENGTH];
+    DWORD len = pfn(hFile, path_buf, MAX_PATH_LENGTH, 0 /* VOLUME_NAME_DOS */);
+    if (len == 0 || len >= MAX_PATH_LENGTH) return FALSE;
+
+    /* Result is prefixed with "\\?\", strip it */
+    WCHAR* path = path_buf;
+    int path_len = (int)len;
+    if (path_len >= 4 && path[0] == L'\\' && path[1] == L'\\' &&
+        path[2] == L'?' && path[3] == L'\\') {
+        path += 4;
+        path_len -= 4;
+    }
+
+    /* Normalize to lowercase */
+    WCHAR norm_path[MAX_PATH_LENGTH];
+    for (int i = 0; i < path_len; i++) {
+        WCHAR c = path[i];
+        if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+        norm_path[i] = c;
+    }
+    norm_path[path_len] = L'\0';
+
+    /* Check if any writable rule covers this path */
+    for (int i = 0; i < g_policy.rule_count; i++) {
+        POLICY_RULE* rule = &g_policy.rules[i];
+        if (rule->is_deny) continue;
+        if (!(rule->access & ACCESS_WRITE)) continue;
+        if (is_subpath(norm_path, path_len, rule->path, rule->path_len)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/**
  * Hook NtFsControlFile to block symlink/junction creation.
  * FSCTL_SET_REPARSE_POINT is the ioctl used by mklink /D, mklink /J, and
  * CreateSymbolicLink(). Blocking this prevents symlink-based sandbox escapes
  * where a link inside an allowed directory points to a denied path.
+ *
+ * Symlinks are allowed within writable directories (e.g., npm link in workspace).
  */
 static NTSTATUS NTAPI hooked_NtFsControlFile(
     HANDLE FileHandle, HANDLE Event,
@@ -797,9 +879,14 @@ static NTSTATUS NTAPI hooked_NtFsControlFile(
     PVOID OutputBuffer, ULONG OutputBufferLength)
 {
     if (FsControlCode == FSCTL_SET_REPARSE_POINT) {
-        DBG("SYMLINK DENIED: FSCTL_SET_REPARSE_POINT blocked");
-        log_violation(L"<symlink>", 9, VIOLATION_SYMLINK);
-        return (NTSTATUS)0xC0000022L;  /* STATUS_ACCESS_DENIED */
+        /* Allow symlink creation within writable directories */
+        if (is_handle_in_writable_dir(FileHandle)) {
+            DBG("SYMLINK ALLOWED: target is in writable directory");
+        } else {
+            DBG("SYMLINK DENIED: FSCTL_SET_REPARSE_POINT blocked");
+            log_violation(L"<symlink>", 9, VIOLATION_SYMLINK);
+            return (NTSTATUS)0xC0000022L;  /* STATUS_ACCESS_DENIED */
+        }
     }
 
     return g_orig_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
@@ -815,7 +902,7 @@ static NTSTATUS NTAPI hooked_NtFsControlFile(
  * Inject this DLL into a suspended process.
  * Uses CreateRemoteThread + LoadLibraryW.
  */
-static BOOL inject_dll_into_process(HANDLE hProcess, HANDLE hThread) {
+static BOOL inject_dll_into_process(HANDLE hProcess) {
     SIZE_T path_size = (wcslen(g_dll_path) + 1) * sizeof(WCHAR);
 
     /* Allocate memory in target for DLL path string */
@@ -892,8 +979,7 @@ static BOOL WINAPI hooked_CreateProcessW(
 
     if (result && lpProcessInformation) {
         /* Inject our DLL into the child process */
-        inject_dll_into_process(lpProcessInformation->hProcess,
-                               lpProcessInformation->hThread);
+        inject_dll_into_process(lpProcessInformation->hProcess);
 
         /* Resume the child's main thread if it wasn't originally suspended */
         if (!was_suspended) {
@@ -926,8 +1012,7 @@ static BOOL WINAPI hooked_CreateProcessA(
         lpStartupInfo, lpProcessInformation);
 
     if (result && lpProcessInformation) {
-        inject_dll_into_process(lpProcessInformation->hProcess,
-                               lpProcessInformation->hThread);
+        inject_dll_into_process(lpProcessInformation->hProcess);
 
         if (!was_suspended) {
             ResumeThread(lpProcessInformation->hThread);
@@ -967,6 +1052,13 @@ static BOOL install_all_hooks(void) {
     if (!g_tramp_NtCreateFile || !g_tramp_NtOpenFile || !g_tramp_NtDeleteFile ||
         !g_tramp_NtFsControlFile || !g_tramp_CreateProcessW || !g_tramp_CreateProcessA) {
         DBG("Failed to allocate trampolines");
+        /* Free any successfully allocated buffers */
+        if (g_tramp_NtCreateFile) { VirtualFree(g_tramp_NtCreateFile, 0, MEM_RELEASE); g_tramp_NtCreateFile = NULL; }
+        if (g_tramp_NtOpenFile) { VirtualFree(g_tramp_NtOpenFile, 0, MEM_RELEASE); g_tramp_NtOpenFile = NULL; }
+        if (g_tramp_NtDeleteFile) { VirtualFree(g_tramp_NtDeleteFile, 0, MEM_RELEASE); g_tramp_NtDeleteFile = NULL; }
+        if (g_tramp_NtFsControlFile) { VirtualFree(g_tramp_NtFsControlFile, 0, MEM_RELEASE); g_tramp_NtFsControlFile = NULL; }
+        if (g_tramp_CreateProcessW) { VirtualFree(g_tramp_CreateProcessW, 0, MEM_RELEASE); g_tramp_CreateProcessW = NULL; }
+        if (g_tramp_CreateProcessA) { VirtualFree(g_tramp_CreateProcessA, 0, MEM_RELEASE); g_tramp_CreateProcessA = NULL; }
         return FALSE;
     }
 
@@ -1022,12 +1114,15 @@ static BOOL init_shared_memory(void) {
         return FALSE;
     }
 
-    /* Get DLL path from environment (for child injection) */
-    DWORD dll_len = GetEnvironmentVariableW(SANDBOX_DLL_PATH_VAR, g_dll_path, MAX_PATH);
-    if (dll_len == 0 || dll_len >= MAX_PATH) {
-        /* Fallback: get our own module path */
-        GetModuleFileNameW(NULL, g_dll_path, MAX_PATH);  /* Will be overwritten below */
+    /* Get DLL path from environment (for child injection).
+     * If not set, g_dll_path already contains the correct path from DllMain
+     * via GetModuleFileNameW(hModule, ...). */
+    WCHAR env_dll_path[MAX_PATH];
+    DWORD dll_len = GetEnvironmentVariableW(SANDBOX_DLL_PATH_VAR, env_dll_path, MAX_PATH);
+    if (dll_len > 0 && dll_len < MAX_PATH) {
+        memcpy(g_dll_path, env_dll_path, (dll_len + 1) * sizeof(WCHAR));
     }
+    /* Otherwise keep g_dll_path set by DllMain (correct module path) */
 
     /* Check debug flag */
     WCHAR dbg_buf[8];

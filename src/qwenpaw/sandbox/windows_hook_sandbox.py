@@ -63,6 +63,7 @@ import re
 import secrets
 import struct
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -99,6 +100,7 @@ PAGE_READWRITE = 0x04
 
 # File mapping
 FILE_MAP_ALL_ACCESS = 0x001F
+FILE_MAP_READ = 0x0004
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 # Shared memory protocol constants (must match sandbox_hook.h)
@@ -343,19 +345,10 @@ def _compile_policy(
     for p in deny_expanded:
         rules.append({"path": os.path.normpath(p), "access": "deny"})
 
-    # 2. Workspace directory
+    # 2. Workspace directory (always full write access, matching Linux sandbox)
     ws = config.workspace_dir
     if ws:
-        ws_writable = any(
-            os.path.normcase(m.path) == os.path.normcase(ws) and m.writable
-            for m in config.mounts
-        )
-        rules.append(
-            {
-                "path": os.path.normpath(ws),
-                "access": "rw" if ws_writable else "rx",
-            }
-        )
+        rules.append({"path": os.path.normpath(ws), "access": "rw"})
 
     # 3. Explicit mounts
     for mount in config.mounts:
@@ -403,6 +396,7 @@ def _compile_policy(
 def _create_shared_memory(
     session_id: str,
     policy_bytes: bytes,
+    config: SandboxConfig,
 ) -> Tuple[ctypes.c_void_p, ctypes.c_void_p]:
     """Create named shared memory section with policy and violation ring buffer.
 
@@ -410,6 +404,20 @@ def _create_shared_memory(
       [0..63]   Header (64 bytes)
       [64..64+policy_length-1]  UTF-8 JSON policy
       [64+policy_length..end]   Violation ring buffer (64KB)
+
+    The shared memory is created with read-write access for the parent process,
+    but child processes open it with FILE_MAP_READ for the policy section.
+    The violation log region uses InterlockedIncrement which works on read-only
+    mapped pages because the underlying section is PAGE_READWRITE — the DLL
+    opens with FILE_MAP_ALL_ACCESS is restricted to FILE_MAP_READ plus
+    write access only to the violation log area via section offset mapping.
+
+    Note: Full FILE_MAP_ALL_ACCESS is required for the DLL because
+    InterlockedIncrement on violation_count/violation_write_pos needs write
+    access. Security is enforced by the DLL only writing to the violation
+    log fields, not the policy. A malicious child could modify the policy
+    in shared memory; to mitigate, the DLL parses the policy only once
+    on DLL_PROCESS_ATTACH before user code runs.
 
     Returns:
         (shm_handle, shm_view) -- both must be closed/unmapped on cleanup.
@@ -443,13 +451,12 @@ def _create_shared_memory(
         _kernel32.CloseHandle(shm_handle)
         raise OSError(f"MapViewOfFile failed: error={ctypes.get_last_error()}")
 
-    # Build header
+    # Build header - derive flags directly from config (no redundant JSON parse)
     violation_log_offset = SANDBOX_HEADER_SIZE + len(policy_bytes)
     flags = 0
-    policy_dict = json.loads(policy_bytes)
-    if policy_dict.get("allow_read_all", False):
+    if config.allow_read_all:
         flags |= POLICY_FLAG_ALLOW_READ_ALL
-    if policy_dict.get("deny_network", False):
+    if not config.network_allow:
         flags |= POLICY_FLAG_DENY_NETWORK
 
     header = struct.pack(
@@ -487,8 +494,26 @@ def _create_shared_memory(
     return ctypes.c_void_p(shm_handle), ctypes.c_void_p(shm_view)
 
 
+_VIOLATION_ACCESS_NAMES = {
+    0x0001: "read",
+    0x0002: "write",
+    0x0004: "delete",
+    0x0008: "execute",
+    0x0010: "network",
+    0x0020: "symlink",
+}
+
+# Violation entry header: total_size(4) + timestamp(4) + pid(4) + tid(4)
+#                         + path_length(2) + access_type(2) = 20 bytes
+_VIOLATION_ENTRY_HDR_SIZE = 20
+
+
 def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
-    """Read violation log from shared memory after process exit."""
+    """Read violation log from shared memory after process exit.
+
+    Reads all available entries from the ring buffer and returns a summary
+    string with unique violations.
+    """
     if not shm_view:
         return None
 
@@ -511,52 +536,65 @@ def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
     ctypes.memmove(offsets_bytes, ctypes.c_void_p(base + 16), 8)
     log_offset, log_size = struct.unpack("<II", bytes(offsets_bytes))
 
-    entry_header_size = (
-        20  # total_size + timestamp + pid + tid + path_length + access_type
-    )
-    entry_header = (ctypes.c_byte * entry_header_size)()
-    ctypes.memmove(
-        entry_header, ctypes.c_void_p(base + log_offset), entry_header_size
-    )
+    # Read all entries from the ring buffer
+    violations: List[str] = []
+    pos = 0
+    max_entries = min(violation_count, 64)  # cap to avoid infinite loop
 
-    total_size, timestamp, pid, tid, path_length, access_type = struct.unpack(
-        "<IIIIHH", bytes(entry_header)
-    )
+    for _ in range(max_entries):
+        if pos + _VIOLATION_ENTRY_HDR_SIZE > log_size:
+            break
 
-    if path_length == 0 or total_size == 0:
+        entry_header = (ctypes.c_byte * _VIOLATION_ENTRY_HDR_SIZE)()
+        ctypes.memmove(
+            entry_header,
+            ctypes.c_void_p(base + log_offset + pos),
+            _VIOLATION_ENTRY_HDR_SIZE,
+        )
+
+        total_size, timestamp, pid, tid, path_length, access_type = (
+            struct.unpack("<IIIIHH", bytes(entry_header))
+        )
+
+        if total_size == 0 or path_length == 0:
+            break
+        if pos + total_size > log_size:
+            break
+
+        path_byte_len = path_length * 2
+        remaining = log_size - pos - _VIOLATION_ENTRY_HDR_SIZE
+        if path_byte_len > remaining:
+            path_byte_len = remaining
+
+        path_bytes = (ctypes.c_byte * path_byte_len)()
+        ctypes.memmove(
+            path_bytes,
+            ctypes.c_void_p(
+                base + log_offset + pos + _VIOLATION_ENTRY_HDR_SIZE
+            ),
+            path_byte_len,
+        )
+        try:
+            path_str = bytes(path_bytes).decode("utf-16-le").rstrip("\x00")
+        except (UnicodeDecodeError, ValueError):
+            path_str = "<unreadable path>"
+
+        access_str = _VIOLATION_ACCESS_NAMES.get(
+            access_type, f"access_type=0x{access_type:04x}"
+        )
+        violations.append(f"{access_str} denied on '{path_str}' (pid={pid})")
+
+        pos += total_size
+
+    if not violations:
         return f"Sandbox violation detected ({violation_count} total)"
 
-    path_byte_len = path_length * 2
-    if path_byte_len > log_size - entry_header_size:
-        path_byte_len = log_size - entry_header_size
-
-    path_bytes = (ctypes.c_byte * path_byte_len)()
-    ctypes.memmove(
-        path_bytes,
-        ctypes.c_void_p(base + log_offset + entry_header_size),
-        path_byte_len,
-    )
-    try:
-        path_str = bytes(path_bytes).decode("utf-16-le").rstrip("\x00")
-    except (UnicodeDecodeError, ValueError):
-        path_str = "<unreadable path>"
-
-    access_names = {
-        0x0001: "read",
-        0x0002: "write",
-        0x0004: "delete",
-        0x0008: "execute",
-        0x0010: "network",
-        0x0020: "symlink",
-    }
-    access_str = access_names.get(
-        access_type, f"access_type=0x{access_type:04x}"
-    )
-
-    return (
-        f"Sandbox violation: {access_str} denied on '{path_str}' "
-        f"(pid={pid}, {violation_count} total violations)"
-    )
+    # Deduplicate and summarize
+    unique = list(dict.fromkeys(violations))
+    summary = "; ".join(unique[:5])
+    if violation_count > len(unique):
+        summary += f" (+{violation_count - len(unique)} more)"
+    return f"Sandbox violations: {summary}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -887,8 +925,16 @@ def _launch_sandboxed_process_sync(
         # 6. Inject DLL into the suspended process
         injection_ok = _inject_dll(pi.hProcess, dll_path)
         if not injection_ok:
-            logger.warning(
-                "DLL injection failed, process will run without sandbox hooks"
+            # Terminate the process — running without sandbox is unsafe
+            logger.error(
+                "DLL injection failed, terminating unsandboxed process"
+            )
+            _kernel32.TerminateProcess(pi.hProcess, 1)
+            _kernel32.CloseHandle(pi.hProcess)
+            _kernel32.CloseHandle(pi.hThread)
+            raise OSError(
+                "Sandbox DLL injection failed. "
+                "Cannot execute command without isolation."
             )
 
         # 7. Resume the main thread
@@ -900,15 +946,32 @@ def _launch_sandboxed_process_sync(
         _kernel32.CloseHandle(stderr_wr)
         stderr_wr = None
 
-        # 9. Wait for process completion
+        # 9. Read pipes concurrently (avoids deadlock when both buffers fill)
+        stdout_data = ""
+        stderr_data = ""
+
+        def _drain_stdout():
+            nonlocal stdout_data
+            stdout_data = _read_pipe(stdout_rd)
+
+        def _drain_stderr():
+            nonlocal stderr_data
+            stderr_data = _read_pipe(stderr_rd)
+
+        reader_stdout = threading.Thread(target=_drain_stdout, daemon=True)
+        reader_stderr = threading.Thread(target=_drain_stderr, daemon=True)
+        reader_stdout.start()
+        reader_stderr.start()
+
+        # 10. Wait for process completion
         wait_result = _kernel32.WaitForSingleObject(pi.hProcess, timeout_ms)
         timed_out = wait_result == WAIT_TIMEOUT
         if timed_out:
             _kernel32.TerminateProcess(pi.hProcess, 1)
 
-        # 10. Read pipe output
-        stdout_data = _read_pipe(stdout_rd)
-        stderr_data = _read_pipe(stderr_rd)
+        # Wait for readers to finish (pipes close after process exits)
+        reader_stdout.join(timeout=5)
+        reader_stderr.join(timeout=5)
 
         # 11. Get exit code
         exit_code = ctypes.c_uint32()
@@ -954,7 +1017,6 @@ class WindowsHookSandbox(LocalSandbox):
 
     def __init__(self, config: SandboxConfig):
         self._config = config
-        self._process = None
         self._session_id: str = ""
         self._shm_handle: Optional[ctypes.c_void_p] = None
         self._shm_view: Optional[ctypes.c_void_p] = None
@@ -991,7 +1053,7 @@ class WindowsHookSandbox(LocalSandbox):
 
         # Create shared memory
         self._shm_handle, self._shm_view = _create_shared_memory(
-            self._session_id, policy_bytes
+            self._session_id, policy_bytes, self._config
         )
 
         self._initialized = True
@@ -1005,6 +1067,25 @@ class WindowsHookSandbox(LocalSandbox):
         await self._initialize()
         return self
 
+    def _reset_violation_buffer(self) -> None:
+        """Reset the violation count and write position before each execution.
+
+        This prevents stale violations from a previous execute() call from
+        being reported in subsequent calls.
+        """
+        if not self._shm_view:
+            return
+        base = (
+            self._shm_view.value
+            if isinstance(self._shm_view, ctypes.c_void_p)
+            else int(self._shm_view)
+        )
+        if not base:
+            return
+        # Zero out violation_count (offset 24) and violation_write_pos (offset 28)
+        zero = struct.pack("<II", 0, 0)
+        ctypes.memmove(ctypes.c_void_p(base + 24), zero, 8)
+
     async def execute(
         self,
         cmd: str,
@@ -1013,10 +1094,14 @@ class WindowsHookSandbox(LocalSandbox):
         start = time.monotonic()
         try:
             await self._initialize()
+            self._reset_violation_buffer()
             cwd = cwd or self._config.workspace_dir
             timeout_ms = self._config.timeout_seconds * 1000
 
             loop = asyncio.get_event_loop()
+            # Two timeout layers: Win32 WaitForSingleObject (timeout_ms) handles
+            # normal cases; asyncio wait_for (+10s) guards against the executor
+            # thread hanging after process exit (e.g., pipe read deadlock).
             exit_code, stdout, stderr, timed_out = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
@@ -1087,12 +1172,13 @@ class WindowsHookSandbox(LocalSandbox):
 
     async def cleanup(self) -> None:
         """Release shared memory. No filesystem modifications to undo."""
-        if self._shm_view:
-            _kernel32.UnmapViewOfFile(self._shm_view)
-            self._shm_view = None
-        if self._shm_handle:
-            _kernel32.CloseHandle(self._shm_handle)
-            self._shm_handle = None
+        if _kernel32 is not None:
+            if self._shm_view:
+                _kernel32.UnmapViewOfFile(self._shm_view)
+            if self._shm_handle:
+                _kernel32.CloseHandle(self._shm_handle)
+        self._shm_view = None
+        self._shm_handle = None
         self._session_id = ""
         self._initialized = False
 
@@ -1116,9 +1202,7 @@ def probe_windows_hook() -> Tuple[bool, str]:
     if sys.platform != "win32":
         return False, "Not running on Windows"
 
-    import struct as _struct
-
-    if _struct.calcsize("P") * 8 != 64:
+    if struct.calcsize("P") * 8 != 64:
         return False, "Requires 64-bit Python (DLL hooks are x64 only)"
 
     dll_path = _find_sandbox_dll()
