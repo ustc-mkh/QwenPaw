@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
-"""Windows sandbox — Pure Python ctypes inline hooking process isolation.
+"""Windows sandbox — DLL injection-based process isolation.
 
-Uses a Python-based sandbox runner that installs inline hooks on NT APIs
-to enforce filesystem access policies. No compiled DLL or external
-libraries required.
+Uses a native DLL (sandbox_hook.dll) injected into the target process to
+enforce filesystem access policies. The DLL hooks NT APIs and propagates
+itself into all child processes via CreateProcessW/A interception.
 
   - **Filesystem isolation**: policy-driven allow/deny via hooked NtCreateFile,
     NtOpenFile, NtDeleteFile. No NTFS ACL modifications required.
 
-  - **Recursive sandboxing**: CreateProcessW/A hooks automatically wrap
-    child processes through the same sandbox runner.
+  - **Child process propagation**: The DLL's CreateProcessW/A hooks
+    automatically inject sandbox_hook.dll into every child process using
+    CREATE_SUSPENDED + CreateRemoteThread + LoadLibraryW. This works for
+    ANY child process regardless of language/runtime.
 
   - **Policy communication**: JSON policy in named shared memory section,
-    identified by a session ID.
+    identified by a session ID (environment variable).
 
   - **Violation reporting**: ring buffer in shared memory records all denied
     access attempts for post-execution inspection.
@@ -20,27 +22,34 @@ libraries required.
 Architecture:
     1. Compile access policy from SandboxConfig into JSON
     2. Create named shared memory section with policy + violation ring buffer
-    3. Launch sandbox_runner.py as child process (hooks install in runner)
-    4. Runner executes target command with hooks active
-    5. Wait for completion, read stdout/stderr from pipes
-    6. Read violation log from shared memory
-    7. Cleanup: close shared memory handle (OS reclaims automatically)
+    3. Create target process in CREATE_SUSPENDED state
+    4. Inject sandbox_hook.dll via CreateRemoteThread(LoadLibraryW)
+    5. Resume target process (hooks are active)
+    6. Wait for completion, read stdout/stderr from pipes
+    7. Read violation log from shared memory
+    8. Cleanup: close shared memory handle
+
+Advantages over pure-Python ctypes hooking:
+    - Automatically propagates to ALL child processes (native, .NET, Python, etc.)
+    - No Python interpreter needed in the target process
+    - Lower overhead: hooks run in native code
+    - More reliable: no GC/GIL interference with hook callbacks
 
 Advantages over AppContainer:
     - No icacls / ACL modifications (instant setup/cleanup)
     - No AppContainer profile creation/deletion
-    - No crash recovery needed (no persistent state)
     - Fine-grained path-level control with dynamic policy
-    - Pure Python: fully debuggable with print/logging/pdb
-    - No external compilation toolchain required
+    - No crash recovery needed (no persistent state)
 
 Limitations:
-    - User-mode hooks can be bypassed by direct syscall (not a concern for
+    - Requires sandbox_hook.dll to be pre-built (MSVC or MinGW-w64 x64)
+    - User-mode hooks can be bypassed by direct syscall (acceptable for
       LLM-generated code running through standard interpreters)
 
 Requirements:
     - Windows 7+ (64-bit)
-    - Python 3.8+ (same interpreter used for both parent and runner)
+    - Python 3.8+
+    - sandbox_hook.dll (x64, built from sandbox_hook.c)
     - Does NOT require Administrator privileges
 """
 
@@ -55,6 +64,7 @@ import secrets
 import struct
 import sys
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .config import ExecutionResult, SandboxConfig
@@ -67,6 +77,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # CreateProcess flags
+CREATE_SUSPENDED = 0x00000004
 CREATE_NO_WINDOW = 0x08000000
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 
@@ -80,8 +91,13 @@ WAIT_TIMEOUT = 0x00000102
 # Handle flags
 HANDLE_FLAG_INHERIT = 0x00000001
 
-# File mapping
+# Memory allocation
+MEM_COMMIT = 0x1000
+MEM_RESERVE = 0x2000
+MEM_RELEASE = 0x8000
 PAGE_READWRITE = 0x04
+
+# File mapping
 FILE_MAP_ALL_ACCESS = 0x001F
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
@@ -95,8 +111,9 @@ SANDBOX_HEADER_SIZE = 64  # bytes
 POLICY_FLAG_DENY_NETWORK = 0x01
 POLICY_FLAG_ALLOW_READ_ALL = 0x02
 
-# Environment variable name for session ID
+# Environment variable names
 SANDBOX_ENV_VAR = "__QWENPAW_SANDBOX_SESSION"
+SANDBOX_DLL_PATH_VAR = "__QWENPAW_SANDBOX_DLL_PATH"
 SANDBOX_SHM_PREFIX = "Local\\QwenPaw_HookPolicy_"
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -178,6 +195,13 @@ _DLL_SIGNATURES = {
         "CreateFileMappingW": ([_VP, _VP, _U32, _U32, _U32, _WP], _VP),
         "MapViewOfFile": ([_VP, _U32, _U32, _U32, _SZ], _VP),
         "UnmapViewOfFile": ([_VP], _I32),
+        "VirtualAllocEx": ([_VP, _VP, _SZ, _U32, _U32], _VP),
+        "VirtualFreeEx": ([_VP, _VP, _SZ, _U32], _I32),
+        "WriteProcessMemory": ([_VP, _VP, _VP, _SZ, _PVP], _I32),
+        "CreateRemoteThread": ([_VP, _VP, _SZ, _VP, _VP, _U32, _PU32], _VP),
+        "ResumeThread": ([_VP], _U32),
+        "GetModuleHandleW": ([_WP], _VP),
+        "GetProcAddress": ([_VP, ctypes.c_char_p], _VP),
     },
 }
 
@@ -256,6 +280,39 @@ def _expand_deny_paths(deny_paths: List[str]) -> List[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# DLL path resolution
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _find_sandbox_dll() -> Optional[str]:
+    """Locate sandbox_hook.dll relative to this package.
+
+    Search order:
+      1. Same directory as this module (windows_dll_hook/)
+      2. Package root sandbox/ directory
+      3. QWENPAW_SANDBOX_DLL_PATH environment variable
+    """
+    # Check in the dll_hook package directory
+    pkg_dir = Path(__file__).parent / "windows_dll_hook"
+    dll_path = pkg_dir / "sandbox_hook.dll"
+    if dll_path.exists():
+        return str(dll_path)
+
+    # Check in the sandbox package root
+    sandbox_dir = Path(__file__).parent
+    dll_path = sandbox_dir / "sandbox_hook.dll"
+    if dll_path.exists():
+        return str(dll_path)
+
+    # Check environment variable
+    env_path = os.environ.get("QWENPAW_SANDBOX_DLL_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Policy compilation
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -264,9 +321,9 @@ def _compile_policy(
     config: SandboxConfig,
     session_id: str,
 ) -> bytes:
-    """Compile SandboxConfig into JSON policy bytes for the sandbox runner.
+    """Compile SandboxConfig into JSON policy bytes for the sandbox DLL.
 
-    Rule priority (evaluated in order by the runner):
+    Rule priority (evaluated in order by the DLL):
       1. deny rules (access="deny") -- always block
       2. explicit mounts/workspace -- longest prefix match
       3. system paths -- read+execute
@@ -293,10 +350,12 @@ def _compile_policy(
             os.path.normcase(m.path) == os.path.normcase(ws) and m.writable
             for m in config.mounts
         )
-        rules.append({
-            "path": os.path.normpath(ws),
-            "access": "rw" if ws_writable else "rx",
-        })
+        rules.append(
+            {
+                "path": os.path.normpath(ws),
+                "access": "rw" if ws_writable else "rx",
+            }
+        )
 
     # 3. Explicit mounts
     for mount in config.mounts:
@@ -321,7 +380,7 @@ def _compile_policy(
     if temp_dir and os.path.isdir(temp_dir):
         rules.append({"path": os.path.normpath(temp_dir), "access": "rw"})
 
-    # 6. Python installation directory (read+execute, needed by sandbox_runner)
+    # 6. Python installation directory (read+execute)
     python_dir = os.path.dirname(sys.executable)
     if python_dir:
         rules.append({"path": os.path.normpath(python_dir), "access": "rx"})
@@ -355,7 +414,9 @@ def _create_shared_memory(
     Returns:
         (shm_handle, shm_view) -- both must be closed/unmapped on cleanup.
     """
-    total_size = SANDBOX_HEADER_SIZE + len(policy_bytes) + SANDBOX_VIOLATION_LOG_SIZE
+    total_size = (
+        SANDBOX_HEADER_SIZE + len(policy_bytes) + SANDBOX_VIOLATION_LOG_SIZE
+    )
     shm_name = f"{SANDBOX_SHM_PREFIX}{session_id}"
 
     shm_handle = _kernel32.CreateFileMappingW(
@@ -380,9 +441,7 @@ def _create_shared_memory(
     )
     if not shm_view:
         _kernel32.CloseHandle(shm_handle)
-        raise OSError(
-            f"MapViewOfFile failed: error={ctypes.get_last_error()}"
-        )
+        raise OSError(f"MapViewOfFile failed: error={ctypes.get_last_error()}")
 
     # Build header
     violation_log_offset = SANDBOX_HEADER_SIZE + len(policy_bytes)
@@ -403,7 +462,14 @@ def _create_shared_memory(
         SANDBOX_VIOLATION_LOG_SIZE,
         0,  # violation_count
         0,  # violation_write_pos
-        0, 0, 0, 0, 0, 0, 0, 0,  # reserved[8]
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,  # reserved[8]
     )
 
     ctypes.memmove(shm_view, header, len(header))
@@ -426,20 +492,32 @@ def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
     if not shm_view:
         return None
 
+    # Extract raw integer address for pointer arithmetic
+    if isinstance(shm_view, ctypes.c_void_p):
+        base = shm_view.value
+    else:
+        base = int(shm_view)
+    if not base:
+        return None
+
     count_bytes = (ctypes.c_byte * 4)()
-    ctypes.memmove(count_bytes, ctypes.c_void_p(shm_view + 24), 4)
+    ctypes.memmove(count_bytes, ctypes.c_void_p(base + 24), 4)
     violation_count = struct.unpack("<I", bytes(count_bytes))[0]
 
     if violation_count == 0:
         return None
 
     offsets_bytes = (ctypes.c_byte * 8)()
-    ctypes.memmove(offsets_bytes, ctypes.c_void_p(shm_view + 16), 8)
+    ctypes.memmove(offsets_bytes, ctypes.c_void_p(base + 16), 8)
     log_offset, log_size = struct.unpack("<II", bytes(offsets_bytes))
 
-    entry_header_size = 20  # total_size + timestamp + pid + tid + path_length + access_type
+    entry_header_size = (
+        20  # total_size + timestamp + pid + tid + path_length + access_type
+    )
     entry_header = (ctypes.c_byte * entry_header_size)()
-    ctypes.memmove(entry_header, ctypes.c_void_p(shm_view + log_offset), entry_header_size)
+    ctypes.memmove(
+        entry_header, ctypes.c_void_p(base + log_offset), entry_header_size
+    )
 
     total_size, timestamp, pid, tid, path_length, access_type = struct.unpack(
         "<IIIIHH", bytes(entry_header)
@@ -455,7 +533,7 @@ def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
     path_bytes = (ctypes.c_byte * path_byte_len)()
     ctypes.memmove(
         path_bytes,
-        ctypes.c_void_p(shm_view + log_offset + entry_header_size),
+        ctypes.c_void_p(base + log_offset + entry_header_size),
         path_byte_len,
     )
     try:
@@ -469,8 +547,11 @@ def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
         0x0004: "delete",
         0x0008: "execute",
         0x0010: "network",
+        0x0020: "symlink",
     }
-    access_str = access_names.get(access_type, f"access_type=0x{access_type:04x}")
+    access_str = access_names.get(
+        access_type, f"access_type=0x{access_type:04x}"
+    )
 
     return (
         f"Sandbox violation: {access_str} denied on '{path_str}' "
@@ -533,6 +614,29 @@ def _read_pipe(handle: ctypes.c_void_p) -> str:
         chunks.append(bytes(buf[: bytes_read.value]))
 
     raw = b"".join(chunks)
+
+    # Detect UTF-16LE: if data has frequent \x00 bytes at odd positions,
+    # it's likely UTF-16LE (PowerShell outputs UTF-16LE in some configurations)
+    if len(raw) >= 2:
+        # Check for UTF-16LE BOM
+        if raw[:2] == b"\xff\xfe":
+            try:
+                return raw.decode("utf-16-le")
+            except (UnicodeDecodeError, ValueError):
+                pass
+        # Heuristic: if >25% of bytes at odd positions are \x00, it's UTF-16LE
+        elif len(raw) >= 4:
+            sample = raw[: min(64, len(raw))]
+            null_at_odd = sum(
+                1 for i in range(1, len(sample), 2) if sample[i] == 0
+            )
+            total_odd = len(sample) // 2
+            if total_odd > 0 and null_at_odd > total_odd * 0.25:
+                try:
+                    return raw.decode("utf-16-le")
+                except (UnicodeDecodeError, ValueError):
+                    pass
+
     for enc in (
         _get_system_oem_encoding(),
         _get_system_ansi_encoding(),
@@ -606,51 +710,146 @@ def _clean_powershell_stderr(stderr: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Sandbox runner launch (replaces DLL injection)
+# DLL injection
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _launch_runner_process_sync(
+def _inject_dll(
+    process_handle: ctypes.c_void_p,
+    dll_path: str,
+) -> bool:
+    """Inject a DLL into a suspended process via CreateRemoteThread + LoadLibraryW.
+
+    Args:
+        process_handle: Handle to the target process (must have appropriate access).
+        dll_path: Full path to the DLL to inject.
+
+    Returns:
+        True if injection succeeded.
+    """
+    # Encode DLL path as UTF-16LE (for LoadLibraryW)
+    dll_path_bytes = (dll_path + "\0").encode("utf-16-le")
+    path_size = len(dll_path_bytes)
+
+    # Allocate memory in target process for the DLL path
+    remote_buf = _kernel32.VirtualAllocEx(
+        process_handle,
+        None,
+        ctypes.c_size_t(path_size),
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    )
+    if not remote_buf:
+        logger.error(
+            "VirtualAllocEx failed: error=%d", ctypes.get_last_error()
+        )
+        return False
+
+    # Write DLL path to target process memory
+    written = ctypes.c_void_p()
+    ok = _kernel32.WriteProcessMemory(
+        process_handle,
+        remote_buf,
+        dll_path_bytes,
+        ctypes.c_size_t(path_size),
+        ctypes.byref(written),
+    )
+    if not ok:
+        logger.error(
+            "WriteProcessMemory failed: error=%d", ctypes.get_last_error()
+        )
+        _kernel32.VirtualFreeEx(
+            process_handle, remote_buf, ctypes.c_size_t(0), MEM_RELEASE
+        )
+        return False
+
+    # Get LoadLibraryW address (same across processes due to ASLR consistency)
+    h_kernel32 = _kernel32.GetModuleHandleW("kernel32.dll")
+    load_library_addr = _kernel32.GetProcAddress(h_kernel32, b"LoadLibraryW")
+    if not load_library_addr:
+        logger.error("Failed to resolve LoadLibraryW address")
+        _kernel32.VirtualFreeEx(
+            process_handle, remote_buf, ctypes.c_size_t(0), MEM_RELEASE
+        )
+        return False
+
+    # Create remote thread calling LoadLibraryW(dll_path)
+    thread_id = ctypes.c_uint32()
+    h_thread = _kernel32.CreateRemoteThread(
+        process_handle,
+        None,
+        ctypes.c_size_t(0),
+        load_library_addr,
+        remote_buf,
+        0,
+        ctypes.byref(thread_id),
+    )
+    if not h_thread:
+        logger.error(
+            "CreateRemoteThread failed: error=%d", ctypes.get_last_error()
+        )
+        _kernel32.VirtualFreeEx(
+            process_handle, remote_buf, ctypes.c_size_t(0), MEM_RELEASE
+        )
+        return False
+
+    # Wait for DLL to load (timeout 10s)
+    _kernel32.WaitForSingleObject(h_thread, 10000)
+    _kernel32.CloseHandle(h_thread)
+
+    # Free remote buffer
+    _kernel32.VirtualFreeEx(
+        process_handle, remote_buf, ctypes.c_size_t(0), MEM_RELEASE
+    )
+
+    logger.debug("DLL injected successfully: %s", dll_path)
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Process launch with DLL injection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _launch_sandboxed_process_sync(
     cmd: str,
     cwd: str,
     session_id: str,
+    dll_path: str,
     env_vars: Optional[Dict[str, str]],
     timeout_ms: int,
 ) -> Tuple[int, str, str, bool]:
-    """Launch the sandbox runner process with the target command.
+    """Launch a process with DLL injection for sandboxing.
 
-    The runner installs inline hooks in its own process and then executes
-    the target command as a subprocess. No DLL injection needed.
+    Strategy:
+      1. Create target process in CREATE_SUSPENDED state
+      2. Inject sandbox_hook.dll via CreateRemoteThread + LoadLibraryW
+      3. Resume the main thread
+      4. Wait for completion, read output
 
     Returns:
         (exit_code, stdout, stderr, timed_out)
     """
-    # 1. Create pipes
+    # 1. Create pipes for stdout/stderr capture
     stdout_rd, stdout_wr = _create_pipes()
     stderr_rd, stderr_wr = _create_pipes()
 
     try:
-        # 2. Build environment (inject session ID for runner to find shm)
+        # 2. Build environment block (inject session ID and DLL path)
         merged = dict(os.environ)
         if env_vars:
             merged.update(env_vars)
         merged[SANDBOX_ENV_VAR] = session_id
-        # Enable debug logging in runner if parent has DEBUG level
+        merged[SANDBOX_DLL_PATH_VAR] = dll_path
+        # Enable debug logging in DLL if parent has DEBUG level
         if logger.isEnabledFor(logging.DEBUG):
             merged["QWENPAW_HOOK_DEBUG"] = "1"
         pairs = [f"{k}={v}" for k, v in merged.items()]
         block_str = "\0".join(pairs) + "\0\0"
         env_block = ctypes.create_unicode_buffer(block_str)
 
-        # 3. Build runner command line
-        # The runner is invoked as: python -m module session_id b64_cmd [cwd]
-        python_exe = sys.executable
-        runner_module = "qwenpaw.sandbox.windows_ctypes_hook.sandbox_runner"
-        b64_cmd = base64.b64encode(cmd.encode("utf-8")).decode("ascii")
-        cmd_line = f'"{python_exe}" -m {runner_module} {session_id} {b64_cmd}'
-        if cwd:
-            b64_cwd = base64.b64encode(cwd.encode("utf-8")).decode("ascii")
-            cmd_line += f" {b64_cwd}"
+        # 3. Build command line (wrap in cmd.exe for shell execution)
+        cmd_line = _build_powershell_command_line(cmd, cwd)
 
         # 4. Fill STARTUPINFOW
         si = STARTUPINFOW()
@@ -660,9 +859,11 @@ def _launch_runner_process_sync(
         si.hStdOutput = stdout_wr
         si.hStdError = stderr_wr
 
-        # 5. CreateProcessW (NOT suspended — hooks install within runner)
+        # 5. CreateProcessW in SUSPENDED state
         pi = PROCESS_INFORMATION()
-        creation_flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
+        creation_flags = (
+            CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
+        )
 
         ok = _kernel32.CreateProcessW(
             None,
@@ -683,27 +884,37 @@ def _launch_runner_process_sync(
                 f"({ctypes.FormatError(err)})"
             )
 
-        # 6. Close child-side write handles
+        # 6. Inject DLL into the suspended process
+        injection_ok = _inject_dll(pi.hProcess, dll_path)
+        if not injection_ok:
+            logger.warning(
+                "DLL injection failed, process will run without sandbox hooks"
+            )
+
+        # 7. Resume the main thread
+        _kernel32.ResumeThread(pi.hThread)
+
+        # 8. Close child-side write handles
         _kernel32.CloseHandle(stdout_wr)
         stdout_wr = None
         _kernel32.CloseHandle(stderr_wr)
         stderr_wr = None
 
-        # 7. Wait for process
+        # 9. Wait for process completion
         wait_result = _kernel32.WaitForSingleObject(pi.hProcess, timeout_ms)
         timed_out = wait_result == WAIT_TIMEOUT
         if timed_out:
             _kernel32.TerminateProcess(pi.hProcess, 1)
 
-        # 8. Read pipe output
+        # 10. Read pipe output
         stdout_data = _read_pipe(stdout_rd)
         stderr_data = _read_pipe(stderr_rd)
 
-        # 9. Get exit code
+        # 11. Get exit code
         exit_code = ctypes.c_uint32()
         _kernel32.GetExitCodeProcess(pi.hProcess, ctypes.byref(exit_code))
 
-        # 10. Cleanup handles
+        # 12. Cleanup handles
         _kernel32.CloseHandle(pi.hProcess)
         _kernel32.CloseHandle(pi.hThread)
 
@@ -728,10 +939,15 @@ def _launch_runner_process_sync(
 
 
 class WindowsHookSandbox(LocalSandbox):
-    """Windows sandbox using pure Python ctypes inline API hooking.
+    """Windows sandbox using DLL injection for NT API hooking.
 
-    No DLL compilation required. Policy is communicated via shared memory.
-    The sandbox runner hooks NT APIs in its own process to enforce rules.
+    Injects sandbox_hook.dll into the target process and all its children.
+    The DLL hooks NtCreateFile/NtOpenFile/NtDeleteFile and propagates itself
+    into child processes via CreateProcessW/A hooks.
+
+    This solves the child-process sandboxing problem: unlike the pure-Python
+    ctypes approach, native DLL injection works for any child process
+    regardless of its runtime (cmd.exe, python.exe, node.exe, etc.).
 
     Lifecycle: per-tool-call (create shared memory, execute, cleanup).
     """
@@ -742,6 +958,7 @@ class WindowsHookSandbox(LocalSandbox):
         self._session_id: str = ""
         self._shm_handle: Optional[ctypes.c_void_p] = None
         self._shm_view: Optional[ctypes.c_void_p] = None
+        self._dll_path: Optional[str] = None
         self._initialized: bool = False
 
     async def _initialize(self) -> None:
@@ -756,6 +973,16 @@ class WindowsHookSandbox(LocalSandbox):
 
         _load_dlls()
 
+        # Locate the DLL
+        self._dll_path = _find_sandbox_dll()
+        if not self._dll_path:
+            raise RuntimeError(
+                "sandbox_hook.dll not found. Build it from "
+                "src/qwenpaw/sandbox/windows_dll_hook/sandbox_hook.c "
+                "using MSVC or MinGW-w64 (x64). Place the DLL in the "
+                "windows_dll_hook/ directory or set QWENPAW_SANDBOX_DLL_PATH."
+            )
+
         # Generate unique session ID
         self._session_id = secrets.token_hex(12)
 
@@ -769,8 +996,9 @@ class WindowsHookSandbox(LocalSandbox):
 
         self._initialized = True
         logger.info(
-            "WindowsHookSandbox initialized: session=%s (pure Python hooks)",
+            "WindowsHookSandbox initialized: session=%s, dll=%s",
             self._session_id,
+            self._dll_path,
         )
 
     async def __aenter__(self):
@@ -792,10 +1020,11 @@ class WindowsHookSandbox(LocalSandbox):
             exit_code, stdout, stderr, timed_out = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
-                    _launch_runner_process_sync,
+                    _launch_sandboxed_process_sync,
                     cmd,
                     cwd,
                     self._session_id,
+                    self._dll_path,
                     self._config.env_vars or None,
                     timeout_ms,
                 ),
@@ -881,17 +1110,26 @@ def probe_windows_hook() -> Tuple[bool, str]:
 
     Returns:
         (available, reason)
-        - available: True if platform is win32 and Python is 64-bit
+        - available: True if platform is win32, Python is 64-bit, and DLL exists
         - reason: Human-readable description
     """
     if sys.platform != "win32":
         return False, "Not running on Windows"
 
     import struct as _struct
+
     if _struct.calcsize("P") * 8 != 64:
-        return False, "Requires 64-bit Python (inline hooks are x64 only)"
+        return False, "Requires 64-bit Python (DLL hooks are x64 only)"
+
+    dll_path = _find_sandbox_dll()
+    if not dll_path:
+        return False, (
+            "sandbox_hook.dll not found. Build from "
+            "windows_dll_hook/sandbox_hook.c (MSVC/MinGW-w64 x64)"
+        )
 
     return True, (
-        "Windows hook sandbox (pure Python ctypes): "
-        "user-mode NT API inline hooking, no DLL or ACL required."
+        f"Windows DLL injection sandbox: "
+        f"NT API hooking via injected DLL ({dll_path}). "
+        f"Propagates to all child processes automatically."
     )
