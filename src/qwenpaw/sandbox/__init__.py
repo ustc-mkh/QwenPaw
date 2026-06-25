@@ -41,6 +41,7 @@ from .local_sandbox import (
     NoneSandbox,
     create_sandbox,
 )
+from .windows_hook_sandbox import WindowsHookSandbox
 from .windows_native_sandbox import WindowsNativeSandbox
 from .windows_sandbox import WindowsSandbox
 
@@ -54,6 +55,7 @@ __all__ = [
     "SandboxCapability",
     "SandboxConfig",
     "SandboxMode",
+    "WindowsHookSandbox",
     "WindowsNativeSandbox",
     "WindowsSandbox",
     "create_sandbox",

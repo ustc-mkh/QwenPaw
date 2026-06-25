@@ -15,6 +15,7 @@ class SandboxMode(str, Enum):
     LANDLOCK = "landlock"  # Linux Landlock LSM (kernel 5.13+)
     WSL2 = "wsl2"  # Windows WSL2 delegated execution + Landlock
     APPCONTAINER = "appcontainer"  # Windows native AppContainer (Win8+)
+    HOOK = "hook"  # Windows user-mode API hook (Detours DLL)
     NONE = "none"  # No isolation, direct execution
 
 
@@ -313,6 +314,37 @@ def _probe_windows_wsl2() -> SandboxCapability:
     )
 
 
+def _probe_windows_hook() -> SandboxCapability:
+    """Probe Windows hook sandbox support (Detours DLL available).
+
+    Detection steps:
+        1. Platform is win32
+        2. Hook DLL file exists at expected path
+        3. DLL is loadable (architecture matches)
+    """
+    try:
+        from .windows_hook_sandbox import probe_windows_hook
+    except ImportError as e:
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason=f"Failed to import windows_hook_sandbox module: {e}",
+        )
+
+    available, reason = probe_windows_hook()
+    if available:
+        return SandboxCapability(
+            supported=True,
+            mode=SandboxMode.HOOK,
+            reason=reason,
+        )
+    return SandboxCapability(
+        supported=False,
+        mode=SandboxMode.NONE,
+        reason=reason,
+    )
+
+
 def _probe_windows_appcontainer() -> SandboxCapability:
     """Probe native Windows AppContainer sandbox support.
 
@@ -358,7 +390,11 @@ def probe_sandbox_support() -> SandboxCapability:
     elif sys.platform == "linux":
         return _probe_linux_landlock()
     elif sys.platform == "win32":
-        # Try native AppContainer first (preferred: no WSL dependency)
+        # Try Hook sandbox first (fastest: no ACL modifications)
+        cap = _probe_windows_hook()
+        if cap.supported:
+            return cap
+        # Fallback: native AppContainer (no WSL dependency)
         cap = _probe_windows_appcontainer()
         if cap.supported:
             return cap
@@ -371,7 +407,7 @@ def probe_sandbox_support() -> SandboxCapability:
             mode=SandboxMode.NONE,
             reason=(
                 "Windows sandbox unavailable: "
-                "AppContainer and WSL2+Landlock both unsupported"
+                "Hook, AppContainer and WSL2+Landlock all unsupported"
             ),
         )
     else:

@@ -490,5 +490,9 @@ def create_sandbox(config: SandboxConfig) -> Any:
         from .windows_native_sandbox import WindowsNativeSandbox
 
         return WindowsNativeSandbox(config)
+    elif config.mode == SandboxMode.HOOK:
+        from .windows_hook_sandbox import WindowsHookSandbox
+
+        return WindowsHookSandbox(config)
     else:
         raise ValueError(f"Unknown sandbox mode: {config.mode}")
