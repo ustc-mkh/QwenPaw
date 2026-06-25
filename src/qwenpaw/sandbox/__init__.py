@@ -40,7 +40,7 @@ from .local_sandbox import (
     NoneSandbox,
     create_sandbox,
 )
-from .windows_hook_sandbox import WindowsHookSandbox
+from .windows_sandbox import WindowsSandbox
 
 __all__ = [
     "ExecutionResult",
@@ -52,7 +52,7 @@ __all__ = [
     "SandboxCapability",
     "SandboxConfig",
     "SandboxMode",
-    "WindowsHookSandbox",
+    "WindowsSandbox",
     "create_sandbox",
     "detect_platform_mode",
     "probe_sandbox_support",

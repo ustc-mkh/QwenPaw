@@ -1,56 +1,99 @@
 # -*- coding: utf-8 -*-
-"""Windows sandbox — DLL injection-based process isolation.
+"""Windows sandbox using DLL injection for user-mode NT API hooking.
 
-Uses a native DLL (sandbox_hook.dll) injected into the target process to
-enforce filesystem access policies. The DLL hooks NT APIs and propagates
-itself into all child processes via CreateProcessW/A interception.
+This module implements a lightweight process-isolation sandbox for Windows by
+injecting a native DLL (``sandbox_hook.dll``) into the target process. The DLL
+intercepts filesystem and process-creation NT APIs to enforce a JSON-described
+access policy, and automatically propagates itself into all child processes.
 
-  - **Filesystem isolation**: policy-driven allow/deny via hooked NtCreateFile,
-    NtOpenFile, NtDeleteFile. No NTFS ACL modifications required.
+The execution shell is **PowerShell** (``powershell.exe -EncodedCommand``).
+Commands are wrapped in a PowerShell script that captures exit codes correctly;
+``cmd.exe`` internal commands (e.g., ``mklink``) must be invoked via
+``cmd /c <command>`` when executed inside the sandbox.
 
-  - **Child process propagation**: The DLL's CreateProcessW/A hooks
-    automatically inject sandbox_hook.dll into every child process using
-    CREATE_SUSPENDED + CreateRemoteThread + LoadLibraryW. This works for
-    ANY child process regardless of language/runtime.
+Capabilities:
+    Filesystem isolation:
+        Policy-driven allow/deny via hooked ``NtCreateFile``, ``NtOpenFile``,
+        and ``NtDeleteFile``. No NTFS ACL modifications required.
 
-  - **Policy communication**: JSON policy in named shared memory section,
-    identified by a session ID (environment variable).
+    Symlink/junction control:
+        Symlink and junction creation (``FSCTL_SET_REPARSE_POINT``) is
+        intercepted via hooked ``NtFsControlFile``. Creation is **allowed**
+        only when the directory handle (where the reparse point is being
+        created) resolves to a path with write access (``"rw"``). Creation
+        in read-only or denied directories is blocked.
 
-  - **Violation reporting**: ring buffer in shared memory records all denied
-    access attempts for post-execution inspection.
+    Child process propagation:
+        The DLL's ``CreateProcessW``/``CreateProcessA`` hooks automatically
+        inject ``sandbox_hook.dll`` into every child process using
+        ``CREATE_SUSPENDED`` + ``CreateRemoteThread`` + ``LoadLibraryW``.
+        This works for any child process regardless of language or runtime.
+
+    Policy communication:
+        JSON policy is stored in a named shared memory section identified by
+        a per-session UUID passed via environment variable.
+
+    Violation reporting:
+        A ring buffer in shared memory records all denied access attempts
+        (with path, PID, TID, timestamp, and access type) for post-execution
+        inspection.
+
+Permission Model:
+    Three access levels per path rule, evaluated by longest-prefix match:
+
+    * ``"deny"`` -- absolute block; highest priority, evaluated first.
+    * ``"rw"`` (read-write) -- full access including file creation, write,
+      delete, and symlink/junction creation.
+    * ``"rx"`` (read-execute) or ``"r"`` (read-only) -- read allowed, write
+      and symlink creation denied.
+
+    Special rules applied unconditionally:
+
+    * **Workspace directory** -- always ``"rw"`` (matches Linux Landlock
+      sandbox behavior).
+    * **TEMP directory** (``%TEMP%``) -- always ``"rw"``.
+    * **System paths** (``%SystemRoot%``, ``%ProgramFiles%``) -- ``"rx"``.
+    * **Python installation** -- ``"rx"``.
+
+    The ``allow_read_all`` flag provides a fallback: when set, any path not
+    covered by an explicit rule is readable (but not writable).
 
 Architecture:
-    1. Compile access policy from SandboxConfig into JSON
-    2. Create named shared memory section with policy + violation ring buffer
-    3. Create target process in CREATE_SUSPENDED state
-    4. Inject sandbox_hook.dll via CreateRemoteThread(LoadLibraryW)
-    5. Resume target process (hooks are active)
-    6. Wait for completion, read stdout/stderr from pipes
-    7. Read violation log from shared memory
-    8. Cleanup: close shared memory handle
+    1. Compile access policy from ``SandboxConfig`` into JSON.
+    2. Create named shared memory section (header + policy + violation buffer).
+    3. Create target process in ``CREATE_SUSPENDED`` state.
+    4. Inject ``sandbox_hook.dll`` via ``CreateRemoteThread(LoadLibraryW)``.
+    5. Resume target process -- hooks are active before user code runs.
+    6. Wait for completion; read stdout/stderr from pipes.
+    7. Read violation ring buffer from shared memory.
+    8. Cleanup: unmap view, close shared memory handle.
 
-Advantages over pure-Python ctypes hooking:
-    - Automatically propagates to ALL child processes (native, .NET, Python, etc.)
-    - No Python interpreter needed in the target process
-    - Lower overhead: hooks run in native code
-    - More reliable: no GC/GIL interference with hook callbacks
+Known Limitations:
+    Syscall bypass:
+        User-mode hooks can be bypassed by programs that issue direct NT
+        syscalls (``syscall`` instruction) without going through ntdll.dll.
+        This is acceptable for the intended threat model (LLM-generated code
+        running through standard interpreters/shells).
 
-Advantages over AppContainer:
-    - No icacls / ACL modifications (instant setup/cleanup)
-    - No AppContainer profile creation/deletion
-    - Fine-grained path-level control with dynamic policy
-    - No crash recovery needed (no persistent state)
+    Symlink-follow bypass:
+        If a symlink is created inside a writable directory and points to a
+        denied path, **reading through the symlink is not blocked**. The DLL
+        hooks ``NtCreateFile``/``NtOpenFile`` and inspects ``ObjectName``,
+        which contains the user-supplied path (the symlink itself). Windows
+        resolves reparse points at the kernel filesystem layer *after* the NT
+        API call, so the DLL never sees the resolved target path. Mitigation:
+        the ``hooked_NtFsControlFile`` could validate the reparse-point target
+        buffer at creation time (not yet implemented).
 
-Limitations:
-    - Requires sandbox_hook.dll to be pre-built (MSVC or MinGW-w64 x64)
-    - User-mode hooks can be bypassed by direct syscall (acceptable for
-      LLM-generated code running through standard interpreters)
+    DLL build requirement:
+        Requires ``sandbox_hook.dll`` to be pre-built (MSVC or MinGW-w64,
+        x64). The DLL source is at ``windows_dll_hook/sandbox_hook.c``.
 
 Requirements:
-    - Windows 7+ (64-bit)
-    - Python 3.8+
-    - sandbox_hook.dll (x64, built from sandbox_hook.c)
-    - Does NOT require Administrator privileges
+    * Windows 7+ (64-bit)
+    * Python 3.8+ (64-bit)
+    * ``sandbox_hook.dll`` (x64, built from ``sandbox_hook.c``)
+    * Does **not** require Administrator privileges
 """
 
 import asyncio
@@ -209,7 +252,10 @@ _DLL_SIGNATURES = {
 
 
 def _load_dlls():
-    """Lazy-load Win32 DLLs and configure function signatures."""
+    """Lazy-load kernel32.dll and configure ctypes function signatures.
+
+    Called once on first sandbox initialization. Subsequent calls are no-ops.
+    """
     global _kernel32
     if _kernel32 is not None:
         return
@@ -231,7 +277,7 @@ _cached_ansi_encoding: Optional[str] = None
 
 
 def _get_system_ansi_encoding() -> str:
-    """Return the codec name for the system ANSI code page."""
+    """Return the Python codec name for the system ANSI code page (``GetACP``)."""
     global _cached_ansi_encoding
     if _cached_ansi_encoding is not None:
         return _cached_ansi_encoding
@@ -244,7 +290,7 @@ def _get_system_ansi_encoding() -> str:
 
 
 def _get_system_oem_encoding() -> str:
-    """Return the codec name for the system OEM code page."""
+    """Return the Python codec name for the system OEM code page (``GetOEMCP``)."""
     global _cached_oem_encoding
     if _cached_oem_encoding is not None:
         return _cached_oem_encoding
@@ -262,7 +308,7 @@ def _get_system_oem_encoding() -> str:
 
 
 def _windows_system_read_paths() -> List[str]:
-    """Return Windows system paths that should always be readable."""
+    """Return Windows system paths that should always be readable (rx)."""
     windir = os.environ.get("SystemRoot", "C:\\Windows")
     progfiles = os.environ.get("ProgramFiles", "C:\\Program Files")
     progfiles86 = os.environ.get(
@@ -274,7 +320,7 @@ def _windows_system_read_paths() -> List[str]:
 
 
 def _expand_deny_paths(deny_paths: List[str]) -> List[str]:
-    """Expand user-relative deny paths."""
+    """Expand ``~``-prefixed deny paths to absolute using ``os.path.expanduser``."""
     return [
         os.path.expanduser(path) if path.startswith("~") else path
         for path in deny_paths
@@ -287,12 +333,15 @@ def _expand_deny_paths(deny_paths: List[str]) -> List[str]:
 
 
 def _find_sandbox_dll() -> Optional[str]:
-    """Locate sandbox_hook.dll relative to this package.
+    """Locate ``sandbox_hook.dll`` on the filesystem.
 
     Search order:
-      1. Same directory as this module (windows_dll_hook/)
-      2. Package root sandbox/ directory
-      3. QWENPAW_SANDBOX_DLL_PATH environment variable
+        1. ``windows_dll_hook/`` subdirectory next to this module.
+        2. Package root ``sandbox/`` directory.
+        3. Path specified by ``QWENPAW_SANDBOX_DLL_PATH`` environment variable.
+
+    Returns:
+        Absolute path to the DLL, or ``None`` if not found.
     """
     # Check in the dll_hook package directory
     pkg_dir = Path(__file__).parent / "windows_dll_hook"
@@ -323,20 +372,41 @@ def _compile_policy(
     config: SandboxConfig,
     session_id: str,
 ) -> bytes:
-    """Compile SandboxConfig into JSON policy bytes for the sandbox DLL.
+    """Compile a ``SandboxConfig`` into JSON policy bytes for the DLL.
 
-    Rule priority (evaluated in order by the DLL):
-      1. deny rules (access="deny") -- always block
-      2. explicit mounts/workspace -- longest prefix match
-      3. system paths -- read+execute
-      4. default: allow_read_all flag controls fallback behavior
+    Produces a JSON document consumed by ``sandbox_hook.dll`` on
+    ``DLL_PROCESS_ATTACH``. The DLL parses the policy once and caches
+    the resulting rule array for the lifetime of the process.
+
+    Rule priority (order in the JSON array matters for the DLL's
+    ``check_access`` longest-prefix-match algorithm):
+        1. **Deny rules** (``access="deny"``) -- absolute block, evaluated
+           first by the DLL regardless of position.
+        2. **Workspace directory** -- always ``"rw"`` (unconditionally
+           writable, matching Linux Landlock sandbox semantics).
+        3. **Explicit mounts** -- ``"rw"``, ``"rx"``, or ``"r"`` depending
+           on ``MountSpec.writable`` / ``MountSpec.executable``.
+        4. **System paths** -- ``"rx"`` (Windows, Program Files).
+        5. **TEMP directory** -- ``"rw"``.
+        6. **Python installation** -- ``"rx"``.
+        7. **Fallback** -- ``allow_read_all`` flag in the policy controls
+           whether unlisted paths default to readable or denied.
+
+    Symlink implications:
+        The DLL's ``is_handle_in_writable_dir()`` checks whether the
+        directory of a reparse point has ``"rw"`` access. Symlink/junction
+        creation is therefore allowed only in workspace, writable mounts,
+        and TEMP; it is blocked in read-only mounts, system paths, and
+        denied paths.
 
     Args:
-        config: Sandbox configuration.
-        session_id: Unique session identifier.
+        config: Sandbox configuration specifying mounts, deny paths, and
+            network policy.
+        session_id: Unique session identifier embedded in the policy for
+            shared-memory section naming.
 
     Returns:
-        UTF-8 encoded JSON bytes.
+        UTF-8 encoded JSON bytes ready to be written into shared memory.
     """
     rules: List[Dict[str, str]] = []
 
@@ -398,29 +468,42 @@ def _create_shared_memory(
     policy_bytes: bytes,
     config: SandboxConfig,
 ) -> Tuple[ctypes.c_void_p, ctypes.c_void_p]:
-    """Create named shared memory section with policy and violation ring buffer.
+    """Create a named shared memory section for policy and violation logging.
 
-    Layout (must match sandbox_hook.h SANDBOX_POLICY_HEADER):
-      [0..63]   Header (64 bytes)
-      [64..64+policy_length-1]  UTF-8 JSON policy
-      [64+policy_length..end]   Violation ring buffer (64KB)
+    The section is named ``Local\\QwenPaw_HookPolicy_<session_id>`` and is
+    opened by the DLL on ``DLL_PROCESS_ATTACH`` using the session ID passed
+    via the ``__QWENPAW_SANDBOX_SESSION`` environment variable.
 
-    The shared memory is created with read-write access for the parent process,
-    but child processes open it with FILE_MAP_READ for the policy section.
-    The violation log region uses InterlockedIncrement which works on read-only
-    mapped pages because the underlying section is PAGE_READWRITE — the DLL
-    opens with FILE_MAP_ALL_ACCESS is restricted to FILE_MAP_READ plus
-    write access only to the violation log area via section offset mapping.
+    Memory layout (must match ``SANDBOX_POLICY_HEADER`` in sandbox_hook.h):
+        ========== ============================== =======
+        Offset     Content                        Size
+        ========== ============================== =======
+        0          Header (magic, version, etc.)  64 B
+        64         UTF-8 JSON policy              variable
+        64+N       Violation ring buffer          64 KB
+        ========== ============================== =======
 
-    Note: Full FILE_MAP_ALL_ACCESS is required for the DLL because
-    InterlockedIncrement on violation_count/violation_write_pos needs write
-    access. Security is enforced by the DLL only writing to the violation
-    log fields, not the policy. A malicious child could modify the policy
-    in shared memory; to mitigate, the DLL parses the policy only once
-    on DLL_PROCESS_ATTACH before user code runs.
+    Security considerations:
+        The DLL maps the section with ``FILE_MAP_ALL_ACCESS`` because the
+        violation ring buffer requires atomic writes (``InterlockedIncrement``
+        on ``violation_count`` and ``violation_write_pos``). A malicious child
+        process could theoretically overwrite the policy region; this is
+        mitigated by the DLL parsing the policy **only once** during
+        ``DLL_PROCESS_ATTACH`` before user code executes.
+
+    Args:
+        session_id: Unique identifier for this sandbox session, used as the
+            shared memory section name suffix.
+        policy_bytes: UTF-8 JSON policy produced by ``_compile_policy``.
+        config: Sandbox configuration (used to derive header flags directly
+            without re-parsing JSON).
 
     Returns:
-        (shm_handle, shm_view) -- both must be closed/unmapped on cleanup.
+        A tuple of ``(shm_handle, shm_view)`` where both must be closed/
+        unmapped during cleanup via ``CloseHandle`` and ``UnmapViewOfFile``.
+
+    Raises:
+        OSError: If ``CreateFileMappingW`` or ``MapViewOfFile`` fails.
     """
     total_size = (
         SANDBOX_HEADER_SIZE + len(policy_bytes) + SANDBOX_VIOLATION_LOG_SIZE
@@ -509,10 +592,23 @@ _VIOLATION_ENTRY_HDR_SIZE = 20
 
 
 def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
-    """Read violation log from shared memory after process exit.
+    """Read the violation ring buffer from shared memory after process exit.
 
-    Reads all available entries from the ring buffer and returns a summary
-    string with unique violations.
+    Parses ``VIOLATION_ENTRY`` records written by the DLL's ``log_violation``
+    function (CAS-loop atomic writes). Each entry contains a timestamp, PID,
+    TID, access type flags, and the offending path in UTF-16LE.
+
+    The function deduplicates violations and returns a human-readable summary
+    of up to 5 unique entries. Violation types include: read, write, delete,
+    execute, network, and symlink.
+
+    Args:
+        shm_view: Mapped view pointer to the shared memory section. May be
+            ``None`` if shared memory was never created.
+
+    Returns:
+        A summary string describing the violations, or ``None`` if no
+        violations were recorded.
     """
     if not shm_view:
         return None
@@ -603,7 +699,17 @@ def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
 
 
 def _create_pipes() -> Tuple[ctypes.c_void_p, ctypes.c_void_p]:
-    """Create an inheritable pipe pair for capturing child process output."""
+    """Create an inheritable pipe pair for capturing child process output.
+
+    The write end is inheritable (passed to the child via ``STARTUPINFOW``);
+    the read end is non-inheritable (kept by the parent for draining).
+
+    Returns:
+        A tuple of ``(read_handle, write_handle)``.
+
+    Raises:
+        OSError: If ``CreatePipe`` fails.
+    """
     read_h = ctypes.c_void_p()
     write_h = ctypes.c_void_p()
 
@@ -626,9 +732,26 @@ def _create_pipes() -> Tuple[ctypes.c_void_p, ctypes.c_void_p]:
 
 
 def _read_pipe(handle: ctypes.c_void_p) -> str:
-    """Read all data from a pipe until EOF.
+    """Read all available data from a pipe handle until EOF.
 
-    Decoding strategy: OEM -> ANSI -> UTF-8 with replacement.
+    Handles the encoding complexity of Windows console output:
+
+    Decoding strategy (tried in order):
+        1. UTF-16LE with BOM detection.
+        2. UTF-16LE heuristic (>25% null bytes at odd positions).
+        3. System OEM code page (``GetOEMCP``).
+        4. System ANSI code page (``GetACP``).
+        5. UTF-8 with replacement (final fallback).
+
+    This multi-codec approach is necessary because PowerShell and child
+    processes (e.g., ``cmd.exe``) may output in different encodings
+    depending on system locale and process configuration.
+
+    Args:
+        handle: Read-end pipe handle from ``_create_pipes``.
+
+    Returns:
+        Decoded string content from the pipe.
     """
     ERROR_BROKEN_PIPE = 109
     chunks: List[bytes] = []
@@ -693,7 +816,29 @@ def _read_pipe(handle: ctypes.c_void_p) -> str:
 
 
 def _build_powershell_command_line(cmd: str, cwd: Optional[str] = None) -> str:
-    """Build a PowerShell command line using -EncodedCommand."""
+    """Build a PowerShell invocation using ``-EncodedCommand`` for safe escaping.
+
+    Wraps the user command in a PowerShell script that:
+        * Suppresses progress output (``$ProgressPreference = SilentlyContinue``)
+        * Optionally sets the working directory via ``Set-Location``
+        * Captures and propagates the correct exit code (``$LASTEXITCODE``)
+
+    The script is encoded as base64 UTF-16LE, which avoids all quoting and
+    escaping issues with complex command strings.
+
+    Note:
+        ``cmd.exe`` internal commands (``mklink``, ``dir``, ``copy``, etc.)
+        must be invoked as ``cmd /c <command>`` since PowerShell does not
+        recognize them as native cmdlets.
+
+    Args:
+        cmd: The command string to execute inside PowerShell.
+        cwd: Optional working directory. If provided, a ``Set-Location``
+            statement is prepended to the script.
+
+    Returns:
+        Full ``powershell.exe`` command line ready for ``CreateProcessW``.
+    """
     if cwd:
         escaped_cwd = cwd.replace("'", "''")
         set_location = f"Set-Location -LiteralPath '{escaped_cwd}'\n"
@@ -720,7 +865,19 @@ def _build_powershell_command_line(cmd: str, cwd: Optional[str] = None) -> str:
 
 
 def _clean_powershell_stderr(stderr: str) -> str:
-    """Clean PowerShell CLIXML stderr output, preserving error messages."""
+    """Clean PowerShell CLIXML-formatted stderr, preserving error messages.
+
+    PowerShell wraps stderr output in CLIXML (``#< CLIXML``) when redirected.
+    This function extracts the human-readable error text from ``<S S="Error">``
+    elements and strips XML boilerplate.
+
+    Args:
+        stderr: Raw stderr string that may contain CLIXML markup.
+
+    Returns:
+        Cleaned error string with XML removed, or the original string if
+        no CLIXML is detected.
+    """
     if not stderr:
         return stderr
 
@@ -758,12 +915,27 @@ def _inject_dll(
 ) -> bool:
     """Inject a DLL into a suspended process via CreateRemoteThread + LoadLibraryW.
 
+    This is the standard DLL injection technique:
+        1. Allocate memory in the target process (``VirtualAllocEx``).
+        2. Write the DLL path as UTF-16LE into the allocated buffer
+           (``WriteProcessMemory``).
+        3. Resolve ``LoadLibraryW`` address (consistent across processes due
+           to ASLR per-boot randomization).
+        4. Create a remote thread calling ``LoadLibraryW(dll_path)``
+           (``CreateRemoteThread``).
+        5. Wait for the thread to complete (DLL's ``DllMain`` has executed).
+        6. Free the remote buffer.
+
+    The target process must be in ``CREATE_SUSPENDED`` state to ensure the
+    DLL hooks are installed before any user code runs.
+
     Args:
-        process_handle: Handle to the target process (must have appropriate access).
-        dll_path: Full path to the DLL to inject.
+        process_handle: Handle to the target process with
+            ``PROCESS_ALL_ACCESS`` rights.
+        dll_path: Absolute path to ``sandbox_hook.dll``.
 
     Returns:
-        True if injection succeeded.
+        ``True`` if injection succeeded, ``False`` otherwise (error is logged).
     """
     # Encode DLL path as UTF-16LE (for LoadLibraryW)
     dll_path_bytes = (dll_path + "\0").encode("utf-16-le")
@@ -857,16 +1029,37 @@ def _launch_sandboxed_process_sync(
     env_vars: Optional[Dict[str, str]],
     timeout_ms: int,
 ) -> Tuple[int, str, str, bool]:
-    """Launch a process with DLL injection for sandboxing.
+    """Launch a sandboxed child process (synchronous, runs in executor thread).
 
-    Strategy:
-      1. Create target process in CREATE_SUSPENDED state
-      2. Inject sandbox_hook.dll via CreateRemoteThread + LoadLibraryW
-      3. Resume the main thread
-      4. Wait for completion, read output
+    Orchestrates the full lifecycle of a sandboxed command execution:
+        1. Create stdout/stderr pipes for output capture.
+        2. Build environment block with session ID and DLL path injected.
+        3. Wrap command in PowerShell via ``_build_powershell_command_line``.
+        4. Create the process in ``CREATE_SUSPENDED`` state.
+        5. Inject ``sandbox_hook.dll`` via ``_inject_dll``.
+        6. Resume the main thread (hooks are now active).
+        7. Drain stdout/stderr pipes in background threads.
+        8. Wait for process exit (with timeout).
+        9. Return captured output and exit status.
+
+    If DLL injection fails, the suspended process is immediately terminated
+    to prevent unprotected execution.
+
+    Args:
+        cmd: Command string to execute (will be wrapped in PowerShell).
+        cwd: Working directory for the child process.
+        session_id: Shared memory session identifier.
+        dll_path: Absolute path to ``sandbox_hook.dll``.
+        env_vars: Additional environment variables to pass to the child.
+        timeout_ms: Maximum execution time in milliseconds. If exceeded,
+            the process is terminated via ``TerminateProcess``.
 
     Returns:
-        (exit_code, stdout, stderr, timed_out)
+        A tuple of ``(exit_code, stdout, stderr, timed_out)``. Exit code is
+        ``-1`` if the process timed out.
+
+    Raises:
+        OSError: If ``CreateProcessW`` or DLL injection fails.
     """
     # 1. Create pipes for stdout/stderr capture
     stdout_rd, stdout_wr = _create_pipes()
@@ -997,22 +1190,52 @@ def _launch_sandboxed_process_sync(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# WindowsHookSandbox class
+# WindowsSandbox class
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-class WindowsHookSandbox(LocalSandbox):
-    """Windows sandbox using DLL injection for NT API hooking.
+class WindowsSandbox(LocalSandbox):
+    """Windows process sandbox using DLL injection and NT API hooking.
 
-    Injects sandbox_hook.dll into the target process and all its children.
-    The DLL hooks NtCreateFile/NtOpenFile/NtDeleteFile and propagates itself
-    into child processes via CreateProcessW/A hooks.
+    Injects ``sandbox_hook.dll`` into the target process and all its
+    descendants. The DLL hooks the following NT APIs:
 
-    This solves the child-process sandboxing problem: unlike the pure-Python
-    ctypes approach, native DLL injection works for any child process
-    regardless of its runtime (cmd.exe, python.exe, node.exe, etc.).
+    * ``NtCreateFile`` / ``NtOpenFile`` -- filesystem read/write/execute
+      access control.
+    * ``NtDeleteFile`` -- file/directory deletion control.
+    * ``NtFsControlFile`` (``FSCTL_SET_REPARSE_POINT``) -- symlink and
+      junction creation control.
+    * ``CreateProcessW`` / ``CreateProcessA`` -- child process propagation
+      (injects the DLL into every spawned child).
 
-    Lifecycle: per-tool-call (create shared memory, execute, cleanup).
+    The sandbox uses **PowerShell** as its execution shell. Commands are
+    wrapped in a ``-EncodedCommand`` invocation that handles exit-code
+    propagation correctly.
+
+    Lifecycle:
+        Designed for per-tool-call usage via async context manager::
+
+            async with WindowsSandbox(config) as sandbox:
+                result = await sandbox.execute("python script.py")
+
+        Shared memory is created once during ``__aenter__`` and reused across
+        multiple ``execute()`` calls within the same context. The violation
+        buffer is reset before each execution.
+
+    Symlink handling:
+        Symlink/junction creation is allowed only in directories with
+        ``"rw"`` access (workspace, writable mounts, TEMP). The DLL's
+        ``hooked_NtFsControlFile`` calls ``is_handle_in_writable_dir()``
+        which resolves the directory handle to a path via
+        ``GetFinalPathNameByHandleW`` and checks it against policy rules.
+
+    Attributes:
+        _config: The sandbox configuration.
+        _session_id: Random hex string identifying this sandbox session.
+        _shm_handle: Win32 handle to the shared memory section.
+        _shm_view: Mapped view pointer for reading violations.
+        _dll_path: Resolved absolute path to ``sandbox_hook.dll``.
+        _initialized: Whether ``_initialize()`` has completed.
     """
 
     def __init__(self, config: SandboxConfig):
@@ -1029,7 +1252,7 @@ class WindowsHookSandbox(LocalSandbox):
 
         if sys.platform != "win32":
             raise RuntimeError(
-                "WindowsHookSandbox requires Windows. "
+                "WindowsSandbox requires Windows. "
                 "Use SandboxMode.NONE for unisolated execution.",
             )
 
@@ -1058,7 +1281,7 @@ class WindowsHookSandbox(LocalSandbox):
 
         self._initialized = True
         logger.info(
-            "WindowsHookSandbox initialized: session=%s, dll=%s",
+            "WindowsSandbox initialized: session=%s, dll=%s",
             self._session_id,
             self._dll_path,
         )
@@ -1068,10 +1291,12 @@ class WindowsHookSandbox(LocalSandbox):
         return self
 
     def _reset_violation_buffer(self) -> None:
-        """Reset the violation count and write position before each execution.
+        """Reset the violation ring buffer counters before each execution.
 
-        This prevents stale violations from a previous execute() call from
-        being reported in subsequent calls.
+        Zeroes out ``violation_count`` (offset 24) and
+        ``violation_write_pos`` (offset 28) in the shared memory header.
+        This prevents stale violations from a previous ``execute()`` call
+        from being reported in subsequent calls within the same session.
         """
         if not self._shm_view:
             return
@@ -1091,6 +1316,23 @@ class WindowsHookSandbox(LocalSandbox):
         cmd: str,
         cwd: Optional[str] = None,
     ) -> ExecutionResult:
+        """Execute a command inside the sandbox.
+
+        The command is wrapped in PowerShell and executed in a child process
+        with ``sandbox_hook.dll`` injected. After execution, the violation
+        ring buffer is inspected for any denied operations.
+
+        Args:
+            cmd: Command string to execute. Shell features (pipes, globs) are
+                handled by PowerShell. Use ``cmd /c <command>`` for cmd.exe
+                internal commands like ``mklink``.
+            cwd: Working directory for the command. Defaults to
+                ``config.workspace_dir``.
+
+        Returns:
+            An ``ExecutionResult`` containing exit code, stdout, stderr,
+            timeout flag, duration, and any sandbox violation summary.
+        """
         start = time.monotonic()
         try:
             await self._initialize()
@@ -1167,11 +1409,16 @@ class WindowsHookSandbox(LocalSandbox):
             )
 
     async def stop(self) -> None:
-        """No-op: process lifetime is managed by the sync launcher."""
+        """No-op; process lifetime is managed by ``_launch_sandboxed_process_sync``."""
         return None
 
     async def cleanup(self) -> None:
-        """Release shared memory. No filesystem modifications to undo."""
+        """Release shared memory resources.
+
+        Unmaps the shared memory view and closes the section handle. No
+        filesystem state (ACLs, temp files, profiles) needs to be cleaned up,
+        unlike kernel-level isolation approaches.
+        """
         if _kernel32 is not None:
             if self._shm_view:
                 _kernel32.UnmapViewOfFile(self._shm_view)
@@ -1192,12 +1439,17 @@ class WindowsHookSandbox(LocalSandbox):
 
 
 def probe_windows_hook() -> Tuple[bool, str]:
-    """Probe Windows hook sandbox capabilities.
+    """Probe whether the Windows hook sandbox is available on this system.
+
+    Checks three requirements:
+        1. Platform is ``win32``.
+        2. Python interpreter is 64-bit (DLL hooks use x64 inline patching).
+        3. ``sandbox_hook.dll`` is locatable via ``_find_sandbox_dll()``.
 
     Returns:
-        (available, reason)
-        - available: True if platform is win32, Python is 64-bit, and DLL exists
-        - reason: Human-readable description
+        A tuple of ``(available, reason)`` where *available* is ``True`` if
+        all requirements are met, and *reason* is a human-readable description
+        of the sandbox capabilities or the reason it is unavailable.
     """
     if sys.platform != "win32":
         return False, "Not running on Windows"

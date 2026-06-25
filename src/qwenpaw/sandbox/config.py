@@ -268,7 +268,7 @@ def _probe_windows_hook() -> SandboxCapability:
         3. DLL is loadable (architecture matches)
     """
     try:
-        from .windows_hook_sandbox import probe_windows_hook
+        from .windows_sandbox import probe_windows_hook
     except ImportError as e:
         return SandboxCapability(
             supported=False,

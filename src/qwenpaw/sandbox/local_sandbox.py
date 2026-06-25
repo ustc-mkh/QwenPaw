@@ -469,7 +469,7 @@ def create_sandbox(config: SandboxConfig) -> Any:
     Supported modes:
       - SEATBELT → MacOSSandbox
       - LANDLOCK → LinuxSandbox
-      - HOOK     → WindowsHookSandbox
+      - HOOK     → WindowsSandbox
       - NONE     → NoneSandbox
     """
     if config.mode == SandboxMode.SEATBELT:
@@ -481,8 +481,8 @@ def create_sandbox(config: SandboxConfig) -> Any:
 
         return LinuxSandbox(config)
     elif config.mode == SandboxMode.HOOK:
-        from .windows_hook_sandbox import WindowsHookSandbox
+        from .windows_sandbox import WindowsSandbox
 
-        return WindowsHookSandbox(config)
+        return WindowsSandbox(config)
     else:
         raise ValueError(f"Unknown sandbox mode: {config.mode}")
