@@ -26,8 +26,7 @@ from qwenpaw.sandbox.config import (
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
     reason=(
-        "Linux sandbox tests require os.uname"
-        " which is unavailable on Windows"
+        "Linux sandbox tests require os.uname which is unavailable on Windows"
     ),
 )
 
@@ -58,16 +57,34 @@ class TestProbeSandboxSupport:
         assert "4.0" in result.reason
 
     @patch("sys.platform", "win32")
-    @patch("qwenpaw.sandbox.config._probe_windows_wsl2")
-    def test_windows_disabled_returns_none(self, mock_probe):
-        # Windows sandbox is currently disabled at probe time.
-        # ``probe_sandbox_support`` should return ``mode=NONE`` directly
-        # without calling ``_probe_windows_wsl2``.
+    @patch("qwenpaw.sandbox.config._probe_windows_hook")
+    def test_windows_delegates_to_hook(self, mock_probe):
+        # Windows sandbox uses hook-based DLL injection.
+        # When the hook probe fails, probe_sandbox_support returns NONE.
+        mock_probe.return_value = SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason="sandbox_hook.dll not found",
+        )
         result = probe_sandbox_support()
         assert result.supported is False
         assert result.mode == SandboxMode.NONE
-        assert "disabled" in result.reason.lower()
-        mock_probe.assert_not_called()
+        assert "unavailable" in result.reason.lower()
+        mock_probe.assert_called_once()
+
+    @patch("sys.platform", "win32")
+    @patch("qwenpaw.sandbox.config._probe_windows_hook")
+    def test_windows_hook_available(self, mock_probe):
+        # When the hook probe succeeds, probe_sandbox_support returns HOOK.
+        mock_probe.return_value = SandboxCapability(
+            supported=True,
+            mode=SandboxMode.HOOK,
+            reason="Windows DLL injection sandbox available",
+        )
+        result = probe_sandbox_support()
+        assert result.supported is True
+        assert result.mode == SandboxMode.HOOK
+        mock_probe.assert_called_once()
 
     @patch("sys.platform", "freebsd13")
     def test_unknown_platform_returns_unsupported(self):

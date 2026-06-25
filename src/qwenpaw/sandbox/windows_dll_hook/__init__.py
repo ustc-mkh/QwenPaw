@@ -2,7 +2,8 @@
 """Windows DLL injection sandbox for file I/O isolation.
 
 This package uses a native DLL (sandbox_hook.dll) that is injected into the
-target process and all its child processes to enforce filesystem access policies.
+target process and all its child processes to enforce filesystem access
+policies.
 
 Unlike the pure-Python ctypes approach, DLL injection propagates automatically
 to all child processes regardless of their language runtime, solving the

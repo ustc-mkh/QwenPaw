@@ -277,7 +277,7 @@ _cached_ansi_encoding: Optional[str] = None
 
 
 def _get_system_ansi_encoding() -> str:
-    """Return the Python codec name for the system ANSI code page (``GetACP``)."""
+    """Return the codec name for the system ANSI code page."""
     global _cached_ansi_encoding
     if _cached_ansi_encoding is not None:
         return _cached_ansi_encoding
@@ -290,7 +290,7 @@ def _get_system_ansi_encoding() -> str:
 
 
 def _get_system_oem_encoding() -> str:
-    """Return the Python codec name for the system OEM code page (``GetOEMCP``)."""
+    """Return the codec name for the system OEM code page."""
     global _cached_oem_encoding
     if _cached_oem_encoding is not None:
         return _cached_oem_encoding
@@ -320,7 +320,7 @@ def _windows_system_read_paths() -> List[str]:
 
 
 def _expand_deny_paths(deny_paths: List[str]) -> List[str]:
-    """Expand ``~``-prefixed deny paths to absolute using ``os.path.expanduser``."""
+    """Expand ``~``-prefixed deny paths to absolute."""
     return [
         os.path.expanduser(path) if path.startswith("~") else path
         for path in deny_paths
@@ -534,7 +534,7 @@ def _create_shared_memory(
         _kernel32.CloseHandle(shm_handle)
         raise OSError(f"MapViewOfFile failed: error={ctypes.get_last_error()}")
 
-    # Build header - derive flags directly from config (no redundant JSON parse)
+    # Build header - derive flags directly from config
     violation_log_offset = SANDBOX_HEADER_SIZE + len(policy_bytes)
     flags = 0
     if config.allow_read_all:
@@ -591,7 +591,9 @@ _VIOLATION_ACCESS_NAMES = {
 _VIOLATION_ENTRY_HDR_SIZE = 20
 
 
-def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
+def _read_violations(  # pylint: disable=too-many-branches
+    shm_view: Optional[ctypes.c_void_p],
+) -> Optional[str]:
     """Read the violation ring buffer from shared memory after process exit.
 
     Parses ``VIOLATION_ENTRY`` records written by the DLL's ``log_violation``
@@ -650,9 +652,9 @@ def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
 
         (
             total_size,
-            timestamp,
+            _timestamp,
             pid,
-            tid,
+            _tid,
             path_length,
             access_type,
         ) = struct.unpack("<IIIIHH", bytes(entry_header))
@@ -664,8 +666,7 @@ def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
 
         path_byte_len = path_length * 2
         remaining = log_size - pos - _VIOLATION_ENTRY_HDR_SIZE
-        if path_byte_len > remaining:
-            path_byte_len = remaining
+        path_byte_len = min(path_byte_len, remaining)
 
         path_bytes = (ctypes.c_byte * path_byte_len)()
         ctypes.memmove(
@@ -737,7 +738,9 @@ def _create_pipes() -> Tuple[ctypes.c_void_p, ctypes.c_void_p]:
     return read_h, write_h
 
 
-def _read_pipe(handle: ctypes.c_void_p) -> str:
+def _read_pipe(  # pylint: disable=too-many-branches
+    handle: ctypes.c_void_p,
+) -> str:
     """Read all available data from a pipe handle until EOF.
 
     Handles the encoding complexity of Windows console output:
@@ -825,13 +828,16 @@ def _read_pipe(handle: ctypes.c_void_p) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _build_powershell_command_line(cmd: str, cwd: Optional[str] = None) -> str:
-    """Build a PowerShell invocation using ``-EncodedCommand`` for safe escaping.
+def _build_powershell_command_line(
+    cmd: str,
+    cwd: Optional[str] = None,
+) -> str:
+    """Build a PowerShell ``-EncodedCommand`` invocation.
 
     Wraps the user command in a PowerShell script that:
-        * Suppresses progress output (``$ProgressPreference = SilentlyContinue``)
-        * Optionally sets the working directory via ``Set-Location``
-        * Captures and propagates the correct exit code (``$LASTEXITCODE``)
+        * Suppresses progress output
+        * Optionally sets the working directory
+        * Captures and propagates the correct exit code
 
     The script is encoded as base64 UTF-16LE, which avoids all quoting and
     escaping issues with complex command strings.
@@ -923,7 +929,7 @@ def _inject_dll(
     process_handle: ctypes.c_void_p,
     dll_path: str,
 ) -> bool:
-    """Inject a DLL into a suspended process via CreateRemoteThread + LoadLibraryW.
+    """Inject a DLL into a suspended process via CreateRemoteThread.
 
     This is the standard DLL injection technique:
         1. Allocate memory in the target process (``VirtualAllocEx``).
@@ -1046,7 +1052,7 @@ def _inject_dll(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _launch_sandboxed_process_sync(
+def _launch_sandboxed_process_sync(  # pylint: disable=too-many-statements
     cmd: str,
     cwd: str,
     session_id: str,
@@ -1334,7 +1340,7 @@ class WindowsSandbox(LocalSandbox):
         )
         if not base:
             return
-        # Zero out violation_count (offset 24) and violation_write_pos (offset 28)
+        # Zero out violation_count (24) and write_pos (28)
         zero = struct.pack("<II", 0, 0)
         ctypes.memmove(ctypes.c_void_p(base + 24), zero, 8)
 
@@ -1368,9 +1374,9 @@ class WindowsSandbox(LocalSandbox):
             timeout_ms = self._config.timeout_seconds * 1000
 
             loop = asyncio.get_event_loop()
-            # Two timeout layers: Win32 WaitForSingleObject (timeout_ms) handles
-            # normal cases; asyncio wait_for (+10s) guards against the executor
-            # thread hanging after process exit (e.g., pipe read deadlock).
+            # Two timeout layers: Win32 WaitForSingleObject
+            # handles normal cases; asyncio wait_for (+10s)
+            # guards against executor thread hangs.
             exit_code, stdout, stderr, timed_out = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
@@ -1436,7 +1442,7 @@ class WindowsSandbox(LocalSandbox):
             )
 
     async def stop(self) -> None:
-        """No-op; process lifetime is managed by ``_launch_sandboxed_process_sync``."""
+        """No-op; process lifetime is managed per-call."""
         return None
 
     async def cleanup(self) -> None:
