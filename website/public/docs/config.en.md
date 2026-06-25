@@ -87,15 +87,16 @@ You can customize paths and behavior via environment variables:
 
 **Path-related:**
 
-| Variable                   | Default             | Description                                                                                                 |
-| -------------------------- | ------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `QWENPAW_WORKING_DIR`      | `~/.qwenpaw`        | Working directory root path                                                                                 |
-| `QWENPAW_SECRET_DIR`       | `~/.qwenpaw.secret` | Sensitive data directory (stores `providers.json` and `envs.json`). Docker default is `/app/working.secret` |
-| `QWENPAW_CONFIG_FILE`      | `config.json`       | Config file name (relative to `QWENPAW_WORKING_DIR`)                                                        |
-| `QWENPAW_HEARTBEAT_FILE`   | `HEARTBEAT.md`      | Heartbeat file name (relative to agent workspace)                                                           |
-| `QWENPAW_JOBS_FILE`        | `jobs.json`         | Cron jobs file name (relative to agent workspace)                                                           |
-| `QWENPAW_CHATS_FILE`       | `chats.json`        | Conversation history file name (relative to agent workspace)                                                |
-| `QWENPAW_TOKEN_USAGE_FILE` | `token_usage.json`  | Token usage record file name (relative to agent workspace)                                                  |
+| Variable                   | Default             | Description                                                                                                                                                                                                                                                                              |
+| -------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `QWENPAW_WORKING_DIR`      | `~/.qwenpaw`        | Working directory root path                                                                                                                                                                                                                                                              |
+| `QWENPAW_SECRET_DIR`       | `~/.qwenpaw.secret` | Sensitive data directory (stores `providers.json` and `envs.json`). Docker default is `/app/working.secret`                                                                                                                                                                              |
+| `QWENPAW_KEYRING_ACCOUNT`  | _(auto)_            | OS keychain account name for the master key. Defaults to `master_key`; when `QWENPAW_WORKING_DIR`/`QWENPAW_SECRET_DIR` are set (e.g. a dev checkout) it auto-derives a per-install account so a dev install never overwrites the stable install's key. Set explicitly to name a profile. |
+| `QWENPAW_CONFIG_FILE`      | `config.json`       | Config file name (relative to `QWENPAW_WORKING_DIR`)                                                                                                                                                                                                                                     |
+| `QWENPAW_HEARTBEAT_FILE`   | `HEARTBEAT.md`      | Heartbeat file name (relative to agent workspace)                                                                                                                                                                                                                                        |
+| `QWENPAW_JOBS_FILE`        | `jobs.json`         | Cron jobs file name (relative to agent workspace)                                                                                                                                                                                                                                        |
+| `QWENPAW_CHATS_FILE`       | `chats.json`        | Conversation history file name (relative to agent workspace)                                                                                                                                                                                                                             |
+| `QWENPAW_TOKEN_USAGE_FILE` | `token_usage.json`  | Token usage record file name (relative to agent workspace)                                                                                                                                                                                                                               |
 
 **Other configuration:**
 
@@ -400,12 +401,11 @@ Controls agent runtime behavior, retry strategies, context management, and memor
 
 **Light Context Compaction (`light_context_config.context_compact_config` object):**
 
-| Field                         | Type  | Default | Description                                                               |
-| ----------------------------- | ----- | ------- | ------------------------------------------------------------------------- |
-| `enabled`                     | bool  | `true`  | Whether to enable automatic context compaction                            |
-| `compact_threshold_ratio`     | float | `0.8`   | Threshold ratio (relative to `max_input_length`) that triggers compaction |
-| `reserve_threshold_ratio`     | float | `0.1`   | Ratio of recent context to preserve after compaction for continuity       |
-| `compact_with_thinking_block` | bool  | `true`  | Whether to include thinking blocks during compaction                      |
+| Field                     | Type  | Default | Description                                                               |
+| ------------------------- | ----- | ------- | ------------------------------------------------------------------------- |
+| `enabled`                 | bool  | `true`  | Whether to enable automatic context compaction                            |
+| `compact_threshold_ratio` | float | `0.8`   | Threshold ratio (relative to `max_input_length`) that triggers compaction |
+| `reserve_threshold_ratio` | float | `0.1`   | Ratio of recent context to preserve after compaction for continuity       |
 
 **Light Tool Result Pruning (`light_context_config.tool_result_pruning_config` object):**
 
@@ -431,12 +431,11 @@ Controls agent runtime behavior, retry strategies, context management, and memor
 
 **Auto Memory Search Configuration (`reme_light_memory_config.auto_memory_search_config` object):**
 
-| Field         | Type  | Default | Description                                                |
-| ------------- | ----- | ------- | ---------------------------------------------------------- |
-| `enabled`     | bool  | `false` | Whether to auto search memory on every conversation turn   |
-| `max_results` | int   | `1`     | Maximum results for auto memory search                     |
-| `min_score`   | float | `0.1`   | Minimum relevance score for auto memory search (0.0 - 1.0) |
-| `timeout`     | float | `10.0`  | Timeout in seconds for auto memory search                  |
+| Field         | Type  | Default | Description                                              |
+| ------------- | ----- | ------- | -------------------------------------------------------- |
+| `enabled`     | bool  | `false` | Whether to auto search memory on every conversation turn |
+| `max_results` | int   | `1`     | Maximum results for auto memory search                   |
+| `timeout`     | float | `10.0`  | Timeout in seconds for auto memory search                |
 
 **Embedding Configuration (`reme_light_memory_config.embedding_model_config` object):**
 

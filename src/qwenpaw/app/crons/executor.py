@@ -22,7 +22,7 @@ class CronExecutor:
         self._workspace = workspace
         self._channel_manager = channel_manager
 
-    # pylint: disable=too-many-statements
+    # pylint: disable=too-many-statements,too-many-branches
     async def execute(self, job: CronJobSpec) -> dict[str, Any]:
         """Execute one job once.
 
@@ -34,6 +34,10 @@ class CronExecutor:
         target_session_id = job.dispatch.target.session_id
         target_channel = job.dispatch.channel
         dispatch_meta: Dict[str, Any] = dict(job.dispatch.meta or {})
+        if job.task_type == "agent":
+            # Agent cron replies still print to the console channel, but
+            # should not raise frontend push bubbles (Inbox remains opt-in).
+            dispatch_meta["suppress_console_push"] = True
         logger.info(
             "cron execute: job_id=%s channel=%s task_type=%s "
             "target_user_id=%s target_session_id=%s",
@@ -88,6 +92,13 @@ class CronExecutor:
 
         req["channel"] = target_channel
         req["user_id"] = target_user_id or "cron"
+        raw_context = req.get("request_context")
+        request_context = (
+            dict(raw_context) if isinstance(raw_context, dict) else {}
+        )
+        request_context["source"] = "cron"
+        request_context["cron_job_id"] = job.id or ""
+        req["request_context"] = request_context
 
         # Determine session_id based on share_session
         share_session = job.runtime.share_session
@@ -102,6 +113,25 @@ class CronExecutor:
                 else f"cron:{job.id}"
             )
             req["session_source"] = "cron"
+
+        # Register a ChatSpec so the session appears in the frontend list.
+        chat_manager = getattr(self._workspace, "chat_manager", None)
+        _chat_spec = None
+        if chat_manager is not None:
+            try:
+                _chat_spec = await chat_manager.get_or_create_chat(
+                    session_id=req["session_id"],
+                    user_id=req.get("user_id", "cron"),
+                    channel=target_channel,
+                    name=job.name or f"Cron: {job.id}",
+                    source="cron",
+                )
+            except Exception:
+                logger.debug(
+                    "cron: failed to register chat spec for job %s",
+                    job.id,
+                    exc_info=True,
+                )
 
         delivery_error: str | None = None
         baseline_messages = await read_session_messages(
@@ -218,3 +248,13 @@ class CronExecutor:
                 error=repr(e),
             )
             raise
+        finally:
+            if _chat_spec is not None and chat_manager is not None:
+                try:
+                    await chat_manager.touch_chat(_chat_spec.id)
+                except Exception:
+                    logger.debug(
+                        "cron: failed to touch chat for job %s",
+                        job.id,
+                        exc_info=True,
+                    )

@@ -751,12 +751,26 @@ async def test_resume_opens_picker_and_replays_selected_session():
 
         # Pick the only session.
         app.screen.dismiss("old-1")
-        for _ in range(10):
+        # ``FakeTransport.load_session`` sets ``transport.loaded`` BEFORE
+        # pushing replay events, so polling that flag races the consume
+        # worker on event loops with different scheduling
+        # (ProactorEventLoop on Windows vs. SelectorEventLoop elsewhere).
+        # Poll the final observable state instead: the last replayed
+        # user turn has been mounted as a UserMessage.
+        for _ in range(20):
             await pilot.pause()
-            if transport.loaded:
+            rendered = " ".join(
+                u.content.plain for u in app.query(UserMessage)
+            )
+            if "Thanks!" in rendered:
                 break
 
         assert transport.loaded == ["old-1"]
+        # Give the UI time to render all replayed events.
+        for _ in range(20):
+            await pilot.pause()
+            if len(app.query(UserMessage)) >= 2:
+                break
         # Welcome banner is cleared; the replayed transcript renders instead.
         assert not list(app.query(WelcomeMessage))
         user_msgs = [u.content.plain for u in app.query(UserMessage)]
@@ -884,9 +898,15 @@ async def test_resume_flag_skips_welcome_and_replays_at_start():
     transport = FakeTransport(resume_session_id="old-1")
     app = PawApp(transport, resume_session_id="old-1")
     async with app.run_test() as pilot:
-        for _ in range(10):
+        # Wait until the final replayed user turn is rendered. Polling
+        # ``transport.loaded`` races the consume worker on event loops
+        # with different scheduling (see twin test above).
+        for _ in range(20):
             await pilot.pause()
-            if transport.loaded:
+            rendered = " ".join(
+                u.content.plain for u in app.query(UserMessage)
+            )
+            if "Thanks!" in rendered:
                 break
         # No welcome banner; the resumed transcript renders instead.
         assert not list(app.query(WelcomeMessage))
@@ -1248,10 +1268,17 @@ async def test_embedded_escaped_file_path_paste_is_copied(
     tmp_path,
     monkeypatch,
 ):
+    import sys
+
     monkeypatch.setenv("PAW_STATE_DIR", str(tmp_path / "state"))
     source = tmp_path / "Screenshot 2026-06-06 at 9.31.17 PM.png"
     source.write_bytes(b"png")
-    escaped = str(source).replace(" ", "\\ ")
+    # On Unix: escape spaces with backslash (shell convention).
+    # On Windows: quote the path (shell convention).
+    if sys.platform == "win32":
+        escaped = f'"{source}"'
+    else:
+        escaped = str(source).replace(" ", "\\ ")
     transport = FakeTransport()
     app = PawApp(transport)
     async with app.run_test() as pilot:

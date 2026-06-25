@@ -4,6 +4,7 @@
 Supported modes:
   - SEATBELT: macOS sandbox-exec kernel isolation
   - LANDLOCK: Linux Landlock LSM kernel isolation (5.13+)
+  - BUBBLEWRAP:  Linux bubblewrap mount-namespace isolation (preferred)
   - HOOK:     Windows user-mode API hook (DLL injection)
   - NONE:     no isolation, direct execution
 
@@ -24,6 +25,7 @@ Usage:
         print(result.stdout)
 """
 
+from .bubblewrap_sandbox import BubblewrapSandbox
 from .config import (
     ExecutionResult,
     MountSpec,
@@ -31,18 +33,19 @@ from .config import (
     SandboxCapability,
     SandboxConfig,
     SandboxMode,
+    create_sandbox,
     detect_platform_mode,
     probe_sandbox_support,
 )
 from .local_sandbox import (
     LocalSandbox,
-    MacOSSandbox,
     NoneSandbox,
-    create_sandbox,
 )
+from .macos_sandbox import MacOSSandbox
 from .windows_sandbox import WindowsSandbox
 
 __all__ = [
+    "BubblewrapSandbox",
     "ExecutionResult",
     "LocalSandbox",
     "MacOSSandbox",

@@ -15,6 +15,7 @@
 [![Discord](https://img.shields.io/badge/Discord-Join_Us-blueviolet.svg?logo=discord)](https://discord.gg/eYMpfnkG8h)
 [![X](https://img.shields.io/badge/X-Follow_Us-black.svg?logo=x)](https://x.com/agentscope_ai)
 [![DingTalk](https://img.shields.io/badge/DingTalk-Join_Us-orange.svg)](https://qr.dingtalk.com/action/joingroup?code=v1,k1,OmDlBXpjW+I2vWjKDsjvI9dhcXjGZi3bQiojOq3dlDw=&_dt_no_comment=1&origin=11)
+[![AgentScope Platform](https://img.shields.io/badge/%E2%98%81_AgentScope_Platform-%F0%9F%90%BE_7%2F24_Online_%26_Free-FF6B2B.svg)](https://platform.agentscope.io/)
 
 [[ドキュメント](https://qwenpaw.agentscope.io/)] [[English](README.md)] [[中文](README_zh.md)] [[Русский](README_ru.md)]
 
@@ -58,23 +59,25 @@
 
 ## ニュース
 
-- [2026-05-27] **v1.1.9 — Coding モード** | エージェントが開発者に。
-
-  > **Coding モード**はフル IDE レイアウト（ファイルツリー + タブ付きエディタ + インライン Diff + Git パネル）を QwenPaw に直接搭載します。[ドキュメント →](https://qwenpaw.agentscope.io/docs/coding-mode)
-
-  <p align="center">
-    <a href="https://qwenpaw.agentscope.io/docs/coding-mode">
-      <img src="https://img.alicdn.com/imgextra/i4/O1CN014tF5921HlXCevvsBH_!!6000000000798-2-tps-3340-1678.png" width="720" alt="Coding モード — 3 パネル IDE レイアウト" />
-    </a>
-  </p>
+- [2026-06-17] **v1.1.12 — モデルページ大刷新 & シンプルモード** | Provider 集約による新モデルページデザイン、フラットナビのシンプルモード追加。
 
   | ハイライト | 内容 |
   |-----------|------|
-  | **Coding モード** | 3 パネル Web IDE。LSP ジャンプ、AST 検索、インライン Diff レビュー対応。[Docs →](https://qwenpaw.agentscope.io/docs/coding-mode) |
-  | **Tauri デスクトップアプリ** | ネイティブ macOS & Windows アプリ。Python 不要。[Download →](https://github.com/agentscope-ai/QwenPaw/releases) |
-  | **統合アクセス制御** | チャネルごとのホワイトリスト/ブラックリスト/承認待ち管理。[Docs →](https://qwenpaw.agentscope.io/docs/channels) |
+  | **モデルページ大刷新** | Provider 集約、統一カード UI & レイアウト刷新。 |
+  | **シンプルモード** | フラットナビ、更新時間順セッションリスト。 |
+  | **ノンブロッキングフラッシュ** | 全チャネルで適応型スロットリング。 |
+  | **ターンごとのトークン使用量** | ターンごとのトークン＆コンテキスト使用量ポップオーバー。 |
+  | **デスクトップポート永続化** | 再起動後もバックエンドポートを維持。 |
 
-  その他：バックグラウンドタスクのタイムアウト、cron ジョブの分離実行、プラグインマネージャー刷新。[v1.1.9 リリースノート →](https://qwenpaw.agentscope.io/release-notes#v1.1.9)
+  その他：ワイドモード、シンタックスハイライト、Langfuse エージェントループグルーピング、Gemini ツールスキーマ修正。[v1.1.12 リリースノート →](https://qwenpaw.agentscope.io/release-notes#v1.1.12)
+
+- [2026-06-11] **AgentScope プラットフォーム公開** — QwenPaw の無料デプロイ、プラグイン共有、Skill マーケットに対応。[今すぐ試す →](https://platform.agentscope.io/)
+
+- [2026-06-10] **v1.1.11** — 無料モデル OAuth、プラグインマーケット、MCP ツールホワイトリスト。[v1.1.11 リリースノート →](https://qwenpaw.agentscope.io/release-notes#v1.1.11)
+
+- [2026-06-01] **v1.1.10** — サブエージェント生成、ディレクトリを開く、Tencent Yuanbao チャネル。[v1.1.10 リリースノート →](https://qwenpaw.agentscope.io/release-notes#v1.1.10)
+
+- [2026-05-27] **v1.1.9** — Coding モード（3 パネル Web IDE）、Tauri デスクトップアプリ、統合アクセス制御。[v1.1.9 リリースノート →](https://qwenpaw.agentscope.io/release-notes#v1.1.9)
 
 - [2026-05-19] **v1.1.8** — 公式プラグイン配布、QwenPaw Pet、DingTalk / Feishu / Telegram ストリーミングカード。[v1.1.8 リリースノート →](https://qwenpaw.agentscope.io/release-notes#v1.1.8)
 
@@ -432,25 +435,15 @@ GitHubでQwenPawにスターを付けて、新しいリリースの通知を即�
 | 方向                     | 項目                                                                                         | 状態         |
 | ------------------------ | -------------------------------------------------------------------------------------------- | ------------ |
 | **横展開**               | より多くのチャネル、モデル、スキル、MCP など — **コミュニティの貢献歓迎**                    | 貢献者募集中 |
-| **既存機能の拡張・改善** | 表示の最適化、ダウンロードヒント、Windows パス互換など — **コミュニティの貢献歓迎**        | 貢献者募集中 |
-| **クライアント体験**     | インストール・アップデート・パッケージングの最適化                                           | 進行中       |
-| **モデル**               | 端末・クラウドモデルのインテリジェント切り替え                                               | 進行中       |
-|                          | OAuth                                                                                        | 計画中       |
-|                          | Response API                                                                                 | 計画中       |
-| **プロアクティブ**       | 定時タスクとハートビートのアップグレード                                                   | 進行中       |
-|                          | 能動的ブリーフィング・カスタムプッシュ                                                     | 進行中       |
-|                          | インサイト：対話とインタラクションからニーズを発掘                                           | 計画中       |
-| **ワークスペース**       | Sandbox 連携のファイル権限制御                                                             | 進行中       |
-|                          | サブディレクトリ分割（設定・本番ファイルなど）                                               | 計画中       |
-| **Coding 能力**          | LSP、専用 Prompt、ワークスペース版管理、実行環境などの配套 infra                             | 計画中       |
-|                          | 軽量ネイティブ API                                                                           | 計画中       |
-|                          | ツール自己進化                                                                               | 計画中       |
-|                          | Claude Code など既存 Agent との互換                                                          | 計画中       |
-| **マルチエージェント**   | グループチャット                                                                             | 計画中       |
-|                          | Subagent                                                                                     | 計画中       |
-|                          | HiClaw エンタープライズ機能                                                                  | 計画中       |
-| **コンテキスト管理**     | コンテキストのインテリジェント圧縮                                                         | 進行中       |
-|                          | ユーザー選択による圧縮（細粒度制御）                                                         | 計画中       |
+| **既存機能の拡張・改善** | 表示の最適化、ダウンロードヒント、Windows パス互換など — **コミュニティの貢献歓迎**          | 貢献者募集中 |
+| **モデル**               | マルチモデル切り替え                                                                         | 進行中       |
+| **Browser-use**          | Chrome 拡張機能のサポート                                                                    | 進行中       |
+| **長期記憶**             | 個人ナレッジベース                                                                           | 進行中       |
+| **QwenPaw アプリケーション** | QwenPaw Creator                                                                           | 進行中       |
+|                          | QwenPaw Insight                                                                              | 進行中       |
+| **マルチエージェント**   | Claude Code など既存 Agent との互換                                                          | 計画中       |
+|                          | グループチャット                                                                             | 計画中       |
+|                          | Subagent の可視化                                                                            | 計画中       |
 
 _状態説明：**進行中** — 積極的に開発中；**計画中** — キューまたは設計段階、貢献も歓迎；**貢献者募集中** — コミュニティの参加を強く推奨。_
 

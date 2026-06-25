@@ -56,15 +56,16 @@ $QWENPAW_SECRET_DIR/                       # 默认 ~/.qwenpaw.secret
 
 **路径相关：**
 
-| 变量                       | 默认值              | 说明                                                                                        |
-| -------------------------- | ------------------- | ------------------------------------------------------------------------------------------- |
-| `QWENPAW_WORKING_DIR`      | `~/.qwenpaw`        | 工作目录根路径                                                                              |
-| `QWENPAW_SECRET_DIR`       | `~/.qwenpaw.secret` | 敏感数据目录（存放 `providers.json` 和 `envs.json`）。Docker 中默认为 `/app/working.secret` |
-| `QWENPAW_CONFIG_FILE`      | `config.json`       | 配置文件名（相对于 `QWENPAW_WORKING_DIR`）                                                  |
-| `QWENPAW_HEARTBEAT_FILE`   | `HEARTBEAT.md`      | 心跳文件名（相对于智能体工作区）                                                            |
-| `QWENPAW_JOBS_FILE`        | `jobs.json`         | 定时任务文件名（相对于智能体工作区）                                                        |
-| `QWENPAW_CHATS_FILE`       | `chats.json`        | 对话历史文件名（相对于智能体工作区）                                                        |
-| `QWENPAW_TOKEN_USAGE_FILE` | `token_usage.json`  | Token 消耗记录文件名（相对于智能体工作区）                                                  |
+| 变量                       | 默认值              | 说明                                                                                                                                                                                                                           |
+| -------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `QWENPAW_WORKING_DIR`      | `~/.qwenpaw`        | 工作目录根路径                                                                                                                                                                                                                 |
+| `QWENPAW_SECRET_DIR`       | `~/.qwenpaw.secret` | 敏感数据目录（存放 `providers.json` 和 `envs.json`）。Docker 中默认为 `/app/working.secret`                                                                                                                                    |
+| `QWENPAW_KEYRING_ACCOUNT`  | _(自动)_            | 主密钥在操作系统钥匙串中的账户名。默认为 `master_key`；当设置了 `QWENPAW_WORKING_DIR`/`QWENPAW_SECRET_DIR`（例如开发检出）时会自动派生为每个安装独立的账户名，使开发安装不会覆盖稳定安装的密钥。可显式设置以命名某个配置档案。 |
+| `QWENPAW_CONFIG_FILE`      | `config.json`       | 配置文件名（相对于 `QWENPAW_WORKING_DIR`）                                                                                                                                                                                     |
+| `QWENPAW_HEARTBEAT_FILE`   | `HEARTBEAT.md`      | 心跳文件名（相对于智能体工作区）                                                                                                                                                                                               |
+| `QWENPAW_JOBS_FILE`        | `jobs.json`         | 定时任务文件名（相对于智能体工作区）                                                                                                                                                                                           |
+| `QWENPAW_CHATS_FILE`       | `chats.json`        | 对话历史文件名（相对于智能体工作区）                                                                                                                                                                                           |
+| `QWENPAW_TOKEN_USAGE_FILE` | `token_usage.json`  | Token 消耗记录文件名（相对于智能体工作区）                                                                                                                                                                                     |
 
 **其他配置：**
 
@@ -353,12 +354,11 @@ MCP（模型上下文协议）允许智能体连接外部服务（如 Filesystem
 
 **Light 上下文压缩配置（`light_context_config.context_compact_config` 对象）：**
 
-| 字段                          | 类型  | 默认值 | 说明                                            |
-| ----------------------------- | ----- | ------ | ----------------------------------------------- |
-| `enabled`                     | bool  | `true` | 是否启用自动上下文压缩                          |
-| `compact_threshold_ratio`     | float | `0.8`  | 触发压缩的阈值比例（相对于 `max_input_length`） |
-| `reserve_threshold_ratio`     | float | `0.1`  | 压缩时保留的最近上下文比例                      |
-| `compact_with_thinking_block` | bool  | `true` | 压缩时是否包含思考块                            |
+| 字段                      | 类型  | 默认值 | 说明                                            |
+| ------------------------- | ----- | ------ | ----------------------------------------------- |
+| `enabled`                 | bool  | `true` | 是否启用自动上下文压缩                          |
+| `compact_threshold_ratio` | float | `0.8`  | 触发压缩的阈值比例（相对于 `max_input_length`） |
+| `reserve_threshold_ratio` | float | `0.1`  | 压缩时保留的最近上下文比例                      |
 
 **Light 工具结果修剪配置（`light_context_config.tool_result_pruning_config` 对象）：**
 
@@ -384,12 +384,11 @@ MCP（模型上下文协议）允许智能体连接外部服务（如 Filesystem
 
 **自动记忆搜索配置（`reme_light_memory_config.auto_memory_search_config` 对象）：**
 
-| 字段          | 类型  | 默认值  | 说明                                        |
-| ------------- | ----- | ------- | ------------------------------------------- |
-| `enabled`     | bool  | `false` | 是否在每轮对话时自动执行记忆搜索            |
-| `max_results` | int   | `1`     | 自动搜索时最多返回的结果数                  |
-| `min_score`   | float | `0.1`   | 自动搜索时的最低相关性分数阈值（0.0 - 1.0） |
-| `timeout`     | float | `10.0`  | 自动搜索超时时间（秒）                      |
+| 字段          | 类型  | 默认值  | 说明                             |
+| ------------- | ----- | ------- | -------------------------------- |
+| `enabled`     | bool  | `false` | 是否在每轮对话时自动执行记忆搜索 |
+| `max_results` | int   | `1`     | 自动搜索时最多返回的结果数       |
+| `timeout`     | float | `10.0`  | 自动搜索超时时间（秒）           |
 
 **Embedding 配置（`reme_light_memory_config.embedding_model_config` 对象）：**
 

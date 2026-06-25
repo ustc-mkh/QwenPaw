@@ -285,6 +285,47 @@ class AppServer:
         return response
 
 
+@pytest.fixture(scope="session", autouse=True)
+def channel_callback_server():
+    """Start a lightweight HTTP server for custom channel outbound.
+
+    Sets ``TEST_CHANNEL_CALLBACK_URL`` in ``os.environ`` so every
+    ``app_server`` subprocess inherits it. Tests that need to inspect
+    recorded payloads request this fixture by name.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+            try:
+                payload = json.loads(body)
+            except (ValueError, UnicodeDecodeError):
+                payload = {
+                    "raw": body.decode("utf-8", errors="replace"),
+                }
+            self.server.recorded.append(payload)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+
+        def log_message(self, fmt, *args):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _Handler)
+    srv.recorded = []
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    os.environ[
+        "TEST_CHANNEL_CALLBACK_URL"
+    ] = f"http://127.0.0.1:{port}/callback"
+    yield srv
+    os.environ.pop("TEST_CHANNEL_CALLBACK_URL", None)
+    srv.shutdown()
+
+
 @pytest.fixture(scope="module")
 def app_server(  # pylint: disable=too-many-statements,too-many-branches
     tmp_path_factory: pytest.TempPathFactory,
@@ -307,6 +348,16 @@ def app_server(  # pylint: disable=too-many-statements,too-many-branches
     secret_dir.mkdir(parents=True, exist_ok=True)
     backups_dir.mkdir(parents=True, exist_ok=True)
 
+    # Copy any custom channel fixtures into the subprocess working dir so
+    # that tests in test_custom_channel.py can discover them at startup.
+    custom_channels_src = Path(__file__).parent / "_custom_channels"
+    if custom_channels_src.is_dir():
+        custom_channels_dst = working_dir / "custom_channels"
+        custom_channels_dst.mkdir(parents=True, exist_ok=True)
+        for src_file in custom_channels_src.iterdir():
+            if src_file.suffix == ".py":
+                shutil.copy2(src_file, custom_channels_dst / src_file.name)
+
     env = os.environ.copy()
     for key in _SENSITIVE_ENV_VARS:
         env.pop(key, None)
@@ -315,6 +366,10 @@ def app_server(  # pylint: disable=too-many-statements,too-many-branches
     env["QWENPAW_SECRET_DIR"] = str(secret_dir)
     env["QWENPAW_BACKUP_DIR"] = str(backups_dir)
     env["QWENPAW_AUTH_ENABLED"] = "false"
+    # Set the upload size limit used by /api/.../upload-limit and the
+    # request-body cap. Read once at app import time from this env var,
+    # so it must be present before the subprocess starts.
+    env["QWENPAW_UPLOAD_MAX_SIZE_MB"] = "10"
     # Integration tests run in a temporary isolated workspace and must not
     # touch the developer's OS keychain. Force file-backed secrets so first
     # encryption does not block on desktop keyring discovery.

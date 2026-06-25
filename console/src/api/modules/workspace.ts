@@ -2,6 +2,7 @@ import { request } from "../request";
 import { getApiUrl } from "../config";
 import { buildAuthHeaders } from "../authHeaders";
 import { useCodeFileCacheStore } from "../../stores/codeFileCacheStore";
+import { downloadFileFromUrl } from "../../utils/downloadFileFromUrl";
 import type { MdFileInfo, MdFileContent, DailyMemoryFile } from "../types";
 
 function getSelectedAgentId(): string {
@@ -35,9 +36,8 @@ function generateFallbackFilename(): string {
   return `qwenpaw_workspace_${agentId}_${timestamp}.zip`;
 }
 
-export interface WorkspaceDownloadResult {
-  blob: Blob;
-  filename: string;
+function encodePath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
 }
 
 export const workspaceApi = {
@@ -62,37 +62,16 @@ export const workspaceApi = {
     ),
 
   // Workspace package download
-  downloadWorkspace: async (): Promise<WorkspaceDownloadResult> => {
-    const response = await fetch(getApiUrl("/workspace/download"), {
-      method: "GET",
-      headers: buildAuthHeaders(),
-    });
-
-    if (!response.ok) {
-      throw new Error(
-        `Workspace download failed: ${response.status} ${response.statusText}`,
-      );
-    }
-
-    const blob = await response.blob();
-
-    // Extract filename from Content-Disposition header
-    const disposition = response.headers.get("Content-Disposition");
-    let filename: string;
-
-    if (disposition) {
-      const filenameMatch = disposition.match(/filename="(.+?)"/);
-      if (filenameMatch && filenameMatch[1]) {
-        filename = filenameMatch[1];
-      } else {
-        filename = generateFallbackFilename();
-      }
-    } else {
-      filename = generateFallbackFilename();
-    }
-
-    return { blob, filename };
-  },
+  downloadWorkspace: () =>
+    downloadFileFromUrl(
+      getApiUrl("/workspace/download"),
+      generateFallbackFilename(),
+      {
+        headers: buildAuthHeaders(),
+        errorMessage: "Workspace download failed",
+        preferResponseFilename: true,
+      },
+    ),
 
   // File upload functionality
   uploadFile: async (
@@ -120,7 +99,8 @@ export const workspaceApi = {
   listDailyMemory: () =>
     request<MdFileInfo[]>("/workspace/memory").then((files) =>
       files.map((file) => {
-        const date = file.filename.replace(".md", "");
+        const basename = file.filename.split("/").pop() || file.filename;
+        const date = basename.replace(".md", "");
         return {
           ...file,
           date,
@@ -129,12 +109,12 @@ export const workspaceApi = {
       }),
     ),
 
-  loadDailyMemory: (date: string) =>
-    request<MdFileContent>(`/workspace/memory/${encodeURIComponent(date)}.md`),
+  loadDailyMemory: (memoryPath: string) =>
+    request<MdFileContent>(`/workspace/memory/${encodePath(memoryPath)}`),
 
-  saveDailyMemory: (date: string, content: string) =>
+  saveDailyMemory: (memoryPath: string, content: string) =>
     request<Record<string, unknown>>(
-      `/workspace/memory/${encodeURIComponent(date)}.md`,
+      `/workspace/memory/${encodePath(memoryPath)}`,
       {
         method: "PUT",
         body: JSON.stringify({ content }),

@@ -11,7 +11,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { Navigate } from "react-router-dom";
+import { Navigate, useLocation } from "react-router-dom";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { Badge, Tooltip } from "antd";
 import {
@@ -26,6 +26,10 @@ import FileTree from "./FileTree";
 import TabbedEditor from "./TabbedEditor";
 import GitPanel from "./GitPanel";
 import Chat from "../Chat";
+import {
+  buildSessionPath,
+  getSessionIdFromPath,
+} from "../../utils/sessionRoute";
 import { useCodingMode } from "../../stores/codingModeStore";
 import {
   useCurrentTabs,
@@ -40,6 +44,7 @@ type LeftPane = "files" | "git";
 
 export default function CodingPage() {
   const { codingMode, initialized } = useCodingMode();
+  const location = useLocation();
 
   // ---- Panel visibility --------------------------------------------------
   const [leftOpen, setLeftOpen] = useState(true);
@@ -134,7 +139,8 @@ export default function CodingPage() {
   );
 
   if (initialized && !codingMode) {
-    return <Navigate to="/chat" replace />;
+    const currentSessionId = getSessionIdFromPath(location.pathname);
+    return <Navigate to={buildSessionPath("chat", currentSessionId)} replace />;
   }
 
   const dirtyCount = tabs.filter((t) => t.dirty).length;
@@ -195,7 +201,7 @@ export default function CodingPage() {
             id="center"
             defaultSize={
               leftOpen && rightOpen
-                ? "55%"
+                ? "35%"
                 : leftOpen || rightOpen
                 ? "70%"
                 : "100%"
@@ -215,7 +221,7 @@ export default function CodingPage() {
           {rightOpen && (
             <>
               <Separator className={styles.sep} />
-              <Panel id="right" defaultSize="30%" className={styles.rightPanel}>
+              <Panel id="right" defaultSize="50%" className={styles.rightPanel}>
                 <div className={styles.chatHeader}>
                   <span className={styles.chatTitle}>
                     <MessageSquare size={13} style={{ marginRight: 5 }} />

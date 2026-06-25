@@ -1,12 +1,15 @@
 import { Layout, Space, Badge, Spin, Tooltip, Dropdown } from "antd";
 import type { MenuProps } from "antd";
-import LanguageSwitcher from "../components/LanguageSwitcher/index";
+import LanguageSwitcher, {
+  LANGUAGE_LIST,
+} from "../components/LanguageSwitcher/index";
 import ThemeToggleButton from "../components/ThemeToggleButton";
 import CodingModeToggle from "../components/CodingModeToggle";
 import { useTranslation } from "react-i18next";
 import { Button, Modal } from "@agentscope-ai/design";
 import styles from "./index.module.less";
 import api from "../api";
+import { openExternalLink } from "../utils/openExternalLink";
 import {
   GITHUB_URL,
   getDocsUrl,
@@ -21,6 +24,7 @@ import {
 } from "./constants";
 import { useTheme } from "../contexts/ThemeContext";
 import { useState, useEffect } from "react";
+import { Slot } from "../plugins/registry/Slot";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -31,7 +35,7 @@ import {
   FileTextOutlined,
   ReadOutlined,
   PlayCircleOutlined,
-  QuestionCircleOutlined,
+  InfoCircleOutlined,
   DownOutlined,
 } from "@ant-design/icons";
 
@@ -64,7 +68,7 @@ function UpdateCodeBlock({ code }: { code: string }) {
 
 export default function Header() {
   const { t, i18n } = useTranslation();
-  const { isDark } = useTheme();
+  const { isDark, setThemeMode } = useTheme();
   const [version, setVersion] = useState<string>("");
   const [latestVersion, setLatestVersion] = useState<string>("");
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
@@ -124,6 +128,77 @@ export default function Header() {
   const hasUpdate =
     !!version && !!latestVersion && compareVersions(latestVersion, version) > 0;
 
+  const resourcesMenuItems: MenuProps["items"] = [
+    {
+      key: "tutorial",
+      icon: <ReadOutlined />,
+      label: t("header.tutorial"),
+      onClick: () => handleNavClick(getDocsUrl(i18n.language)),
+    },
+    {
+      key: "featureDemos",
+      icon: <PlayCircleOutlined />,
+      label: t("header.featureDemos"),
+      onClick: () => handleNavClick(getFeatureDemosUrl(i18n.language)),
+    },
+    {
+      key: "changelog",
+      icon: <FileTextOutlined />,
+      label: t("header.changelog"),
+      onClick: () => handleNavClick(getReleaseNotesUrl(i18n.language)),
+    },
+    {
+      key: "faq",
+      icon: <InfoCircleOutlined />,
+      label: t("header.faq"),
+      onClick: () => handleNavClick(getFaqUrl(i18n.language)),
+    },
+    {
+      key: "github",
+      icon: <GithubOutlined />,
+      label: t("header.github"),
+      onClick: () => handleNavClick(GITHUB_URL),
+    },
+  ];
+
+  const mobileMenuItems: MenuProps["items"] = [
+    {
+      key: "language",
+      label: t("sidebar.settings.language"),
+      children: LANGUAGE_LIST.map(({ key, label }) => ({
+        key,
+        label,
+        onClick: () => {
+          i18n.changeLanguage(key);
+          localStorage.setItem("language", key);
+        },
+      })),
+    },
+    {
+      key: "theme",
+      label: t("sidebar.settings.theme"),
+      children: [
+        {
+          key: "light",
+          label: t("theme.light"),
+          onClick: () => setThemeMode("light"),
+        },
+        {
+          key: "dark",
+          label: t("theme.dark"),
+          onClick: () => setThemeMode("dark"),
+        },
+        {
+          key: "system",
+          label: t("theme.system"),
+          onClick: () => setThemeMode("system"),
+        },
+      ],
+    },
+    { type: "divider" },
+    ...resourcesMenuItems,
+  ];
+
   const handleOpenUpdateModal = () => {
     setUpdateMarkdown("");
     setUpdateModalOpen(true);
@@ -152,25 +227,26 @@ export default function Header() {
   };
 
   const handleNavClick = (url: string) => {
-    if (url) {
-      const pywebview = (window as any).pywebview;
-      if (pywebview?.api) {
-        pywebview.api.open_external_link(url);
-      } else {
-        window.open(url, "_blank");
-      }
-    }
+    openExternalLink(url);
   };
 
   return (
     <>
       <AntHeader className={styles.header}>
         <div className={styles.logoWrapper}>
-          <img
-            src={isDark ? "/logo-dark.svg" : "/logo-light.svg"}
-            alt="QwenPaw"
-            className={styles.logoImg}
-          />
+          {/*
+            Slot lets a plugin replace the brand logo (e.g. a per-agent
+            branding override). When no plugin registers a replacement —
+            or when the registered render returns null — the host default
+            <img> below paints.
+          */}
+          <Slot name="header.logo" kind="replace">
+            <img
+              src={isDark ? "/logo-dark.svg" : "/logo-light.svg"}
+              alt="QwenPaw"
+              className={styles.logoImg}
+            />
+          </Slot>
           <div className={styles.logoDivider} />
           {version && (
             <Badge
@@ -191,57 +267,45 @@ export default function Header() {
             </Badge>
           )}
         </div>
+        <Slot name="header.left" kind="fill" />
         <Space size="middle">
-          <Dropdown
-            menu={{
-              items: [
-                {
-                  key: "tutorial",
-                  icon: <ReadOutlined />,
-                  label: t("header.tutorial"),
-                  onClick: () => handleNavClick(getDocsUrl(i18n.language)),
-                },
-                {
-                  key: "featureDemos",
-                  icon: <PlayCircleOutlined />,
-                  label: t("header.featureDemos"),
-                  onClick: () =>
-                    handleNavClick(getFeatureDemosUrl(i18n.language)),
-                },
-                {
-                  key: "changelog",
-                  icon: <FileTextOutlined />,
-                  label: t("header.changelog"),
-                  onClick: () =>
-                    handleNavClick(getReleaseNotesUrl(i18n.language)),
-                },
-                {
-                  key: "faq",
-                  icon: <QuestionCircleOutlined />,
-                  label: t("header.faq"),
-                  onClick: () => handleNavClick(getFaqUrl(i18n.language)),
-                },
-              ] as MenuProps["items"],
-            }}
-          >
-            <Button type="text">
-              {t("header.resources")} <DownOutlined />
-            </Button>
-          </Dropdown>
+          <Slot name="header.right" kind="fill" />
+          {resourcesMenuItems.length > 0 && (
+            <Dropdown menu={{ items: resourcesMenuItems }}>
+              <Button type="text" className={styles.hideOnMobile}>
+                {t("header.resources")} <DownOutlined />
+              </Button>
+            </Dropdown>
+          )}
           <Tooltip title={t("header.github")}>
             <Button
               type="text"
               icon={<GithubOutlined />}
               onClick={() => handleNavClick(GITHUB_URL)}
+              className={styles.hideOnMobile}
             >
               {t("header.github")}
             </Button>
           </Tooltip>
           <div className={styles.headerDivider} />
-          <CodingModeToggle />
+          <span className={styles.hideOnMobile}>
+            <CodingModeToggle />
+          </span>
           <div className={styles.headerDivider} />
-          <LanguageSwitcher />
-          <ThemeToggleButton />
+          <span className={styles.hideOnMobile}>
+            <LanguageSwitcher />
+          </span>
+          <span className={styles.hideOnMobile}>
+            <ThemeToggleButton />
+          </span>
+          <Dropdown menu={{ items: mobileMenuItems }} placement="bottomRight">
+            <Button
+              type="text"
+              icon={<InfoCircleOutlined />}
+              className={styles.showOnMobile}
+              title={t("header.resources")}
+            />
+          </Dropdown>
         </Space>
       </AntHeader>
 
