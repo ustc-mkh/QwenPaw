@@ -41,9 +41,9 @@ class SandboxMode(str, Enum):
     """Sandbox isolation mode."""
 
     SEATBELT = "seatbelt"  # macOS sandbox-exec
-    LANDLOCK = "landlock"  # Linux Landlock LSM (kernel 5.13+)
-    HOOK = "hook"  # Windows user-mode API hook (DLL injection)
     BUBBLEWRAP = "bubblewrap"  # Linux bubblewrap (preferred)
+    LANDLOCK = "landlock"  # Linux Landlock LSM (fallback)
+    HOOK = "hook"  # Windows user-mode API hook (DLL injection)
     NONE = "none"  # No isolation, direct execution
 
 

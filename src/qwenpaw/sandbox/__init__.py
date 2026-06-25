@@ -2,11 +2,11 @@
 """Sandbox — lightweight local execution isolation.
 
 Supported modes:
-  - SEATBELT: macOS sandbox-exec kernel isolation
-  - LANDLOCK: Linux Landlock LSM kernel isolation (5.13+)
+  - SEATBELT:    macOS sandbox-exec kernel isolation
   - BUBBLEWRAP:  Linux bubblewrap mount-namespace isolation (preferred)
-  - HOOK:     Windows user-mode API hook (DLL injection)
-  - NONE:     no isolation, direct execution
+  - LANDLOCK:    Linux Landlock LSM kernel isolation (5.13+, fallback)
+  - HOOK:        Windows user-mode API hook (DLL injection)
+  - NONE:        no isolation, direct execution
 
 Lifecycle: per-tool-call (created and destroyed for each invocation).
 
