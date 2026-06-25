@@ -520,7 +520,7 @@ def _create_shared_memory(
     )
     if not shm_handle:
         raise OSError(
-            f"CreateFileMappingW failed: error={ctypes.get_last_error()}"
+            f"CreateFileMappingW failed: error={ctypes.get_last_error()}",
         )
 
     shm_view = _kernel32.MapViewOfFile(
@@ -648,9 +648,14 @@ def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
             _VIOLATION_ENTRY_HDR_SIZE,
         )
 
-        total_size, timestamp, pid, tid, path_length, access_type = (
-            struct.unpack("<IIIIHH", bytes(entry_header))
-        )
+        (
+            total_size,
+            timestamp,
+            pid,
+            tid,
+            path_length,
+            access_type,
+        ) = struct.unpack("<IIIIHH", bytes(entry_header))
 
         if total_size == 0 or path_length == 0:
             break
@@ -666,7 +671,7 @@ def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
         ctypes.memmove(
             path_bytes,
             ctypes.c_void_p(
-                base + log_offset + pos + _VIOLATION_ENTRY_HDR_SIZE
+                base + log_offset + pos + _VIOLATION_ENTRY_HDR_SIZE,
             ),
             path_byte_len,
         )
@@ -676,7 +681,8 @@ def _read_violations(shm_view: ctypes.c_void_p) -> Optional[str]:
             path_str = "<unreadable path>"
 
         access_str = _VIOLATION_ACCESS_NAMES.get(
-            access_type, f"access_type=0x{access_type:04x}"
+            access_type,
+            f"access_type=0x{access_type:04x}",
         )
         violations.append(f"{access_str} denied on '{path_str}' (pid={pid})")
 
@@ -761,7 +767,11 @@ def _read_pipe(handle: ctypes.c_void_p) -> str:
 
     while True:
         ok = _kernel32.ReadFile(
-            handle, buf, buf_size, ctypes.byref(bytes_read), None
+            handle,
+            buf,
+            buf_size,
+            ctypes.byref(bytes_read),
+            None,
         )
         if not ok:
             if bytes_read.value > 0:
@@ -951,7 +961,8 @@ def _inject_dll(
     )
     if not remote_buf:
         logger.error(
-            "VirtualAllocEx failed: error=%d", ctypes.get_last_error()
+            "VirtualAllocEx failed: error=%d",
+            ctypes.get_last_error(),
         )
         return False
 
@@ -966,10 +977,14 @@ def _inject_dll(
     )
     if not ok:
         logger.error(
-            "WriteProcessMemory failed: error=%d", ctypes.get_last_error()
+            "WriteProcessMemory failed: error=%d",
+            ctypes.get_last_error(),
         )
         _kernel32.VirtualFreeEx(
-            process_handle, remote_buf, ctypes.c_size_t(0), MEM_RELEASE
+            process_handle,
+            remote_buf,
+            ctypes.c_size_t(0),
+            MEM_RELEASE,
         )
         return False
 
@@ -979,7 +994,10 @@ def _inject_dll(
     if not load_library_addr:
         logger.error("Failed to resolve LoadLibraryW address")
         _kernel32.VirtualFreeEx(
-            process_handle, remote_buf, ctypes.c_size_t(0), MEM_RELEASE
+            process_handle,
+            remote_buf,
+            ctypes.c_size_t(0),
+            MEM_RELEASE,
         )
         return False
 
@@ -996,10 +1014,14 @@ def _inject_dll(
     )
     if not h_thread:
         logger.error(
-            "CreateRemoteThread failed: error=%d", ctypes.get_last_error()
+            "CreateRemoteThread failed: error=%d",
+            ctypes.get_last_error(),
         )
         _kernel32.VirtualFreeEx(
-            process_handle, remote_buf, ctypes.c_size_t(0), MEM_RELEASE
+            process_handle,
+            remote_buf,
+            ctypes.c_size_t(0),
+            MEM_RELEASE,
         )
         return False
 
@@ -1009,7 +1031,10 @@ def _inject_dll(
 
     # Free remote buffer
     _kernel32.VirtualFreeEx(
-        process_handle, remote_buf, ctypes.c_size_t(0), MEM_RELEASE
+        process_handle,
+        remote_buf,
+        ctypes.c_size_t(0),
+        MEM_RELEASE,
     )
 
     logger.debug("DLL injected successfully: %s", dll_path)
@@ -1112,7 +1137,7 @@ def _launch_sandboxed_process_sync(
             err = ctypes.get_last_error()
             raise OSError(
                 f"CreateProcessW failed: error={err} "
-                f"({ctypes.FormatError(err)})"
+                f"({ctypes.FormatError(err)})",
             )
 
         # 6. Inject DLL into the suspended process
@@ -1120,14 +1145,14 @@ def _launch_sandboxed_process_sync(
         if not injection_ok:
             # Terminate the process — running without sandbox is unsafe
             logger.error(
-                "DLL injection failed, terminating unsandboxed process"
+                "DLL injection failed, terminating unsandboxed process",
             )
             _kernel32.TerminateProcess(pi.hProcess, 1)
             _kernel32.CloseHandle(pi.hProcess)
             _kernel32.CloseHandle(pi.hThread)
             raise OSError(
                 "Sandbox DLL injection failed. "
-                "Cannot execute command without isolation."
+                "Cannot execute command without isolation.",
             )
 
         # 7. Resume the main thread
@@ -1265,7 +1290,7 @@ class WindowsSandbox(LocalSandbox):
                 "sandbox_hook.dll not found. Build it from "
                 "src/qwenpaw/sandbox/windows_dll_hook/sandbox_hook.c "
                 "using MSVC or MinGW-w64 (x64). Place the DLL in the "
-                "windows_dll_hook/ directory or set QWENPAW_SANDBOX_DLL_PATH."
+                "windows_dll_hook/ directory or set QWENPAW_SANDBOX_DLL_PATH.",
             )
 
         # Generate unique session ID
@@ -1276,7 +1301,9 @@ class WindowsSandbox(LocalSandbox):
 
         # Create shared memory
         self._shm_handle, self._shm_view = _create_shared_memory(
-            self._session_id, policy_bytes, self._config
+            self._session_id,
+            policy_bytes,
+            self._config,
         )
 
         self._initialized = True

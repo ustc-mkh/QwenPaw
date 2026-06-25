@@ -344,7 +344,9 @@ class TestConfigProbeWindows:
     @patch("qwenpaw.sandbox.config._probe_windows_wsl2")
     @patch("qwenpaw.sandbox.config._probe_windows_appcontainer")
     def test_appcontainer_available_returns_appcontainer(
-        self, mock_ac_probe, mock_wsl_probe
+        self,
+        mock_ac_probe,
+        mock_wsl_probe,
     ):
         from qwenpaw.sandbox.config import (
             SandboxCapability,
@@ -365,7 +367,9 @@ class TestConfigProbeWindows:
     @patch("qwenpaw.sandbox.config._probe_windows_wsl2")
     @patch("qwenpaw.sandbox.config._probe_windows_appcontainer")
     def test_appcontainer_unavailable_falls_back_to_wsl2(
-        self, mock_ac_probe, mock_wsl_probe
+        self,
+        mock_ac_probe,
+        mock_wsl_probe,
     ):
         from qwenpaw.sandbox.config import (
             SandboxCapability,
@@ -392,7 +396,9 @@ class TestConfigProbeWindows:
     @patch("qwenpaw.sandbox.config._probe_windows_wsl2")
     @patch("qwenpaw.sandbox.config._probe_windows_appcontainer")
     def test_both_unavailable_returns_none(
-        self, mock_ac_probe, mock_wsl_probe
+        self,
+        mock_ac_probe,
+        mock_wsl_probe,
     ):
         from qwenpaw.sandbox.config import (
             SandboxCapability,
