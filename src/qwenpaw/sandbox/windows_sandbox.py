@@ -443,19 +443,6 @@ def _compile_policy(
     if temp_dir and os.path.isdir(temp_dir):
         rules.append({"path": os.path.normpath(temp_dir), "access": "rw"})
 
-    # 5b. PowerShell profile data directory (writable)
-    # PowerShell writes StartupProfileData-NonInteractive on every launch;
-    # without this rule every sandbox execution reports a spurious violation.
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if local_appdata:
-        ps_profile_dir = os.path.join(
-            local_appdata, "Microsoft", "Windows", "PowerShell"
-        )
-        if os.path.isdir(ps_profile_dir):
-            rules.append(
-                {"path": os.path.normpath(ps_profile_dir), "access": "rw"}
-            )
-
     # 6. Python installation directory (read+execute)
     python_dir = os.path.dirname(sys.executable)
     if python_dir:
@@ -599,12 +586,112 @@ _VIOLATION_ACCESS_NAMES = {
     0x0020: "symlink",
 }
 
-# Violation entry header: total_size(4) + timestamp(4) + pid(4) + tid(4)
-#                         + path_length(2) + access_type(2) = 20 bytes
-_VIOLATION_ENTRY_HDR_SIZE = 20
+# New entry format (DLL with commit field):
+#   total_size(4) + commit(4) + timestamp(4) + pid(4) + tid(4)
+#   + path_length(2) + access_type(2) = 24 bytes
+_VIOLATION_ENTRY_HDR_SIZE_V2 = 24
+_VIOLATION_ENTRY_FMT_V2 = (
+    "<IIIIIHH"  # total_size, commit, ts, pid, tid, pathlen, type
+)
+
+# Old entry format (DLL without commit field):
+#   total_size(4) + timestamp(4) + pid(4) + tid(4)
+#   + path_length(2) + access_type(2) = 20 bytes
+_VIOLATION_ENTRY_HDR_SIZE_V1 = 20
+_VIOLATION_ENTRY_FMT_V1 = "<IIIIHH"  # total_size, ts, pid, tid, pathlen, type
+
+_VIOLATION_COMMIT_MAGIC = 0x564D4F43  # "COMV" - marks entry as fully written
 
 
-def _read_violations(  # pylint: disable=too-many-branches
+def _parse_ring_buffer(
+    base: int,
+    log_offset: int,
+    log_size: int,
+    violation_count: int,
+    hdr_size: int,
+    fmt: str,
+    check_commit: bool,
+) -> List[str]:
+    """Parse violation entries from the ring buffer with the given format.
+
+    Args:
+        base: Base address of the shared memory view.
+        log_offset: Byte offset from base to the start of the ring buffer.
+        log_size: Total size of the ring buffer in bytes.
+        violation_count: Number of violations reported by the DLL.
+        hdr_size: Size of the entry header (20 for v1, 24 for v2).
+        fmt: struct format string for the entry header.
+        check_commit: Whether to verify the commit field (v2 only).
+
+    Returns:
+        List of violation description strings.
+    """
+    violations: List[str] = []
+    pos = 0
+    max_entries = min(violation_count, 64)
+
+    for _ in range(max_entries):
+        if pos + hdr_size > log_size:
+            break
+
+        entry_header = (ctypes.c_byte * hdr_size)()
+        ctypes.memmove(
+            entry_header,
+            ctypes.c_void_p(base + log_offset + pos),
+            hdr_size,
+        )
+
+        fields = struct.unpack(fmt, bytes(entry_header))
+
+        if check_commit:
+            # V2 format: total_size, commit, timestamp, pid, tid, path_length, access_type
+            total_size, commit, _ts, pid, _tid, path_length, access_type = (
+                fields
+            )
+        else:
+            # V1 format: total_size, timestamp, pid, tid, path_length, access_type
+            total_size, _ts, pid, _tid, path_length, access_type = fields
+            commit = _VIOLATION_COMMIT_MAGIC  # Treat all as committed
+
+        if total_size == 0 or path_length == 0:
+            break
+        if pos + total_size > log_size:
+            break
+        # Skip torn entries: writer sets commit last with a memory fence
+        if commit != _VIOLATION_COMMIT_MAGIC:
+            pos += total_size
+            continue
+
+        path_byte_len = path_length * 2
+        remaining = log_size - pos - hdr_size
+        path_byte_len = min(path_byte_len, remaining)
+
+        if path_byte_len > 0:
+            path_bytes = (ctypes.c_byte * path_byte_len)()
+            ctypes.memmove(
+                path_bytes,
+                ctypes.c_void_p(base + log_offset + pos + hdr_size),
+                path_byte_len,
+            )
+            try:
+                path_str = bytes(path_bytes).decode("utf-16-le").rstrip("\x00")
+            except (UnicodeDecodeError, ValueError):
+                path_str = "<unreadable path>"
+        else:
+            path_str = "<unreadable path>"
+
+        access_str = _VIOLATION_ACCESS_NAMES.get(
+            access_type,
+            f"access_type=0x{access_type:04x}",
+        )
+        violations.append(f"{access_str} denied on '{path_str}' (pid={pid})")
+
+        pos += total_size
+
+    return violations
+
+
+def _read_violations(
     shm_view: Optional[ctypes.c_void_p],
 ) -> Optional[str]:
     """Read the violation ring buffer from shared memory after process exit.
@@ -612,6 +699,11 @@ def _read_violations(  # pylint: disable=too-many-branches
     Parses ``VIOLATION_ENTRY`` records written by the DLL's ``log_violation``
     function (CAS-loop atomic writes). Each entry contains a timestamp, PID,
     TID, access type flags, and the offending path in UTF-16LE.
+
+    Supports both the v2 format (24-byte header with commit field for torn-read
+    detection) and the legacy v1 format (20-byte header without commit field).
+    If v2 parsing yields no results despite violations being reported, falls
+    back to v1 parsing automatically.
 
     The function deduplicates violations and returns a human-readable summary
     of up to 5 unique entries. Violation types include: read, write, delete,
@@ -647,60 +739,28 @@ def _read_violations(  # pylint: disable=too-many-branches
     ctypes.memmove(offsets_bytes, ctypes.c_void_p(base + 16), 8)
     log_offset, log_size = struct.unpack("<II", bytes(offsets_bytes))
 
-    # Read all entries from the ring buffer
-    violations: List[str] = []
-    pos = 0
-    max_entries = min(violation_count, 64)  # cap to avoid infinite loop
+    # Try v2 format first (24-byte header with commit field)
+    violations = _parse_ring_buffer(
+        base,
+        log_offset,
+        log_size,
+        violation_count,
+        _VIOLATION_ENTRY_HDR_SIZE_V2,
+        _VIOLATION_ENTRY_FMT_V2,
+        check_commit=True,
+    )
 
-    for _ in range(max_entries):
-        if pos + _VIOLATION_ENTRY_HDR_SIZE > log_size:
-            break
-
-        entry_header = (ctypes.c_byte * _VIOLATION_ENTRY_HDR_SIZE)()
-        ctypes.memmove(
-            entry_header,
-            ctypes.c_void_p(base + log_offset + pos),
-            _VIOLATION_ENTRY_HDR_SIZE,
+    # If v2 yielded nothing, fall back to v1 (old DLL without commit field)
+    if not violations:
+        violations = _parse_ring_buffer(
+            base,
+            log_offset,
+            log_size,
+            violation_count,
+            _VIOLATION_ENTRY_HDR_SIZE_V1,
+            _VIOLATION_ENTRY_FMT_V1,
+            check_commit=False,
         )
-
-        (
-            total_size,
-            _timestamp,
-            pid,
-            _tid,
-            path_length,
-            access_type,
-        ) = struct.unpack("<IIIIHH", bytes(entry_header))
-
-        if total_size == 0 or path_length == 0:
-            break
-        if pos + total_size > log_size:
-            break
-
-        path_byte_len = path_length * 2
-        remaining = log_size - pos - _VIOLATION_ENTRY_HDR_SIZE
-        path_byte_len = min(path_byte_len, remaining)
-
-        path_bytes = (ctypes.c_byte * path_byte_len)()
-        ctypes.memmove(
-            path_bytes,
-            ctypes.c_void_p(
-                base + log_offset + pos + _VIOLATION_ENTRY_HDR_SIZE,
-            ),
-            path_byte_len,
-        )
-        try:
-            path_str = bytes(path_bytes).decode("utf-16-le").rstrip("\x00")
-        except (UnicodeDecodeError, ValueError):
-            path_str = "<unreadable path>"
-
-        access_str = _VIOLATION_ACCESS_NAMES.get(
-            access_type,
-            f"access_type=0x{access_type:04x}",
-        )
-        violations.append(f"{access_str} denied on '{path_str}' (pid={pid})")
-
-        pos += total_size
 
     if not violations:
         return f"Sandbox violation detected ({violation_count} total)"

@@ -56,6 +56,7 @@ typedef struct _SANDBOX_POLICY_HEADER {
 #pragma pack(push, 1)
 typedef struct _VIOLATION_ENTRY {
     DWORD total_size;       /* Size of this entry including path */
+    DWORD commit;           /* Set to VIOLATION_COMMIT_MAGIC after full write */
     DWORD timestamp;        /* GetTickCount() */
     DWORD pid;              /* Process ID */
     DWORD tid;              /* Thread ID */
@@ -66,6 +67,7 @@ typedef struct _VIOLATION_ENTRY {
 #pragma pack(pop)
 
 #define VIOLATION_ENTRY_HDR_SIZE sizeof(VIOLATION_ENTRY)
+#define VIOLATION_COMMIT_MAGIC  0x564D4F43  /* "COMV" - marks entry as fully written */
 
 /* Violation type flags */
 #define VIOLATION_READ      0x0001
@@ -106,8 +108,7 @@ typedef struct _VIOLATION_ENTRY {
 typedef struct _POLICY_RULE {
     WCHAR path[MAX_PATH_LENGTH];    /* Normalized: lowercase, backslash, no trailing */
     int   path_len;                 /* wcslen(path) */
-    BYTE  access;                   /* ACCESS_* bitmask */
-    BYTE  is_deny;                  /* 1 for deny rules */
+    BYTE  access;                   /* ACCESS_* bitmask; ACCESS_DENY (0x00) for deny rules */
 } POLICY_RULE;
 
 typedef struct _SANDBOX_POLICY {

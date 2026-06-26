@@ -6,7 +6,7 @@
  *   - ntdll!NtCreateFile
  *   - ntdll!NtOpenFile
  *   - ntdll!NtDeleteFile
- *   - ntdll!NtFsControlFile  (blocks symlink/junction creation)
+ *   - ntdll!NtFsControlFile  (validates symlink/junction creation)
  *   - kernel32!CreateProcessW
  *   - kernel32!CreateProcessA
  *
@@ -23,10 +23,10 @@
  *
  * Dependencies: Microsoft Detours (hooking), cJSON (policy parsing)
  * Build: cmake with vcpkg toolchain (see build.bat)
+ * Minimum OS: Windows 10
  */
 
 #define WIN32_LEAN_AND_MEAN
-#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <winternl.h>
 #include <cstdio>
@@ -145,35 +145,77 @@ static PFN_CreateProcessA  g_orig_CreateProcessA = NULL;
 #define DBG(fmt, ...) do { \
     if (g_debug) { \
         char _buf[512]; \
-        _snprintf(_buf, sizeof(_buf), "[sandbox_hook %u] " fmt "\n", \
-                  GetCurrentProcessId(), ##__VA_ARGS__); \
+        _snprintf_s(_buf, sizeof(_buf), _TRUNCATE, "[sandbox_hook %u] " fmt "\n", \
+                    GetCurrentProcessId(), ##__VA_ARGS__); \
         OutputDebugStringA(_buf); \
     } \
 } while(0)
 
 /* ===========================================================================
- * Policy JSON parsing (cJSON)
+ * Unified path normalization
  * =========================================================================== */
 
-/* Normalize path: lowercase, forward slash -> backslash, strip trailing backslash */
-static void normalize_path_to_wchar(const char* utf8_path, WCHAR* out, int max_wchars) {
-    int len = MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, out, max_wchars);
-    if (len <= 0) {
-        out[0] = L'\0';
-        return;
+/**
+ * Normalize a wide path to canonical Win32 form for policy comparison.
+ *   1. Strip \??\ or \\?\ prefix
+ *   2. Skip \Device\* paths (return 0 -- not filesystem)
+ *   3. Replace '/' with '\'
+ *   4. Lowercase via _wcslwr_s
+ *   5. Strip trailing '\' (unless root like "c:\")
+ *
+ * @param src       Source wide string (not necessarily null-terminated)
+ * @param src_len   Number of WCHARs in src (-1 if null-terminated)
+ * @param out       Output buffer (must be at least out_max WCHARs)
+ * @param out_max   Maximum WCHARs that can be written to out
+ * @return          Length of normalized path in WCHARs, or 0 on failure/skip
+ */
+static int normalize_to_win32(const WCHAR* src, int src_len,
+                              WCHAR* out, int out_max) {
+    if (!src) return 0;
+    if (src_len < 0) src_len = (int)wcslen(src);
+    if (src_len == 0) return 0;
+
+    const WCHAR* p = src;
+    int plen = src_len;
+
+    /* Strip \??\ prefix (NT object path) */
+    if (plen >= 4 && p[0] == L'\\' && p[1] == L'?' && p[2] == L'?' && p[3] == L'\\') {
+        p += 4;
+        plen -= 4;
     }
-    /* Lowercase and normalize separators */
-    for (int i = 0; out[i]; i++) {
-        if (out[i] == L'/') out[i] = L'\\';
-        if (out[i] >= L'A' && out[i] <= L'Z')
-            out[i] = out[i] - L'A' + L'a';
+    /* Strip \\?\ prefix (extended-length Win32 path) */
+    else if (plen >= 4 && p[0] == L'\\' && p[1] == L'\\' && p[2] == L'?' && p[3] == L'\\') {
+        p += 4;
+        plen -= 4;
     }
+    /* Skip all \Device\ paths -- kernel device objects, not filesystem */
+    else if (plen >= 8 && _wcsnicmp(p, L"\\Device\\", 8) == 0) {
+        return 0;
+    }
+
+    if (plen <= 0 || plen >= out_max) return 0;
+
+    /* Copy and replace '/' with '\' */
+    for (int i = 0; i < plen; i++) {
+        out[i] = (p[i] == L'/') ? L'\\' : p[i];
+    }
+    out[plen] = L'\0';
+
+    /* Lowercase using CRT (statically linked, safe) */
+    _wcslwr_s(out, (size_t)plen + 1);
+
     /* Strip trailing backslash (unless root like "c:\") */
-    int wlen = (int)wcslen(out);
-    if (wlen > 3 && out[wlen - 1] == L'\\') {
-        out[wlen - 1] = L'\0';
+    if (plen > 3 && out[plen - 1] == L'\\') {
+        out[plen - 1] = L'\0';
+        plen--;
     }
+
+    return plen;
 }
+
+/* ===========================================================================
+ * Policy JSON parsing (cJSON)
+ * =========================================================================== */
 
 static BOOL parse_policy_json(const char* json, SANDBOX_POLICY* policy) {
     memset(policy, 0, sizeof(SANDBOX_POLICY));
@@ -209,24 +251,26 @@ static BOOL parse_policy_json(const char* json, SANDBOX_POLICY* policy) {
 
             POLICY_RULE* rule = &policy->rules[policy->rule_count];
 
-            normalize_path_to_wchar(path_item->valuestring, rule->path, MAX_PATH_LENGTH);
-            rule->path_len = (int)wcslen(rule->path);
+            /* Convert UTF-8 path to wide, then normalize */
+            WCHAR temp[MAX_PATH_LENGTH];
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, path_item->valuestring, -1,
+                                           temp, MAX_PATH_LENGTH);
+            if (wlen <= 0) continue;
+
+            rule->path_len = normalize_to_win32(temp, wlen - 1, rule->path, MAX_PATH_LENGTH);
+            if (rule->path_len == 0) continue;
 
             const char* access_str = cJSON_IsString(access_item)
                                          ? access_item->valuestring : "r";
 
             if (strcmp(access_str, "deny") == 0) {
                 rule->access = ACCESS_DENY;
-                rule->is_deny = 1;
             } else if (strcmp(access_str, "rw") == 0) {
                 rule->access = ACCESS_FULL;
-                rule->is_deny = 0;
             } else if (strcmp(access_str, "rx") == 0) {
                 rule->access = ACCESS_READ_EXECUTE;
-                rule->is_deny = 0;
             } else {
                 rule->access = ACCESS_READ;
-                rule->is_deny = 0;
             }
 
             policy->rule_count++;
@@ -250,47 +294,28 @@ static BOOL is_subpath(const WCHAR* path, int path_len,
 }
 
 /**
- * Normalize an NT path (e.g. \??\C:\...) to a comparable Win32 path.
- * Returns path length or 0 if path cannot be normalized.
+ * Find the best matching policy rule for a normalized path.
+ * Returns a pointer to the matching rule, or NULL if no rule matches.
+ * Deny rules have absolute priority and are returned immediately.
+ * Otherwise, the longest-prefix (most specific) allow rule is returned.
  */
-static int normalize_nt_path(const WCHAR* raw, int raw_len,
-                             WCHAR* out, int out_max) {
-    if (!raw || raw_len <= 0) return 0;
+static const POLICY_RULE* find_matching_rule(const WCHAR* norm_path, int path_len) {
+    const POLICY_RULE* best = NULL;
+    int best_len = 0;
 
-    const WCHAR* src = raw;
-    int src_len = raw_len;
-
-    /* Strip \??\ prefix */
-    if (src_len >= 4 && src[0] == L'\\' && src[1] == L'?' &&
-        src[2] == L'?' && src[3] == L'\\') {
-        src += 4;
-        src_len -= 4;
+    for (int i = 0; i < g_policy.rule_count; i++) {
+        const POLICY_RULE* rule = &g_policy.rules[i];
+        if (is_subpath(norm_path, path_len, rule->path, rule->path_len)) {
+            if (rule->access == ACCESS_DENY) {
+                return rule;  /* Deny has absolute priority */
+            }
+            if (rule->path_len > best_len) {
+                best_len = rule->path_len;
+                best = rule;
+            }
+        }
     }
-    /* Skip ALL \Device\ paths -- these are kernel device objects, not filesystem.
-     * Includes: \Device\KSecDD, \Device\Afd, \Device\NamedPipe,
-     *           \Device\HarddiskVolume (can't resolve to drive letter), etc. */
-    else if (src_len >= 8 && _wcsnicmp(src, L"\\Device\\", 8) == 0) {
-        return 0;
-    }
-
-    if (src_len <= 0 || src_len >= out_max) return 0;
-
-    /* Copy and normalize: lowercase, forward->backslash */
-    for (int i = 0; i < src_len; i++) {
-        WCHAR c = src[i];
-        if (c == L'/') c = L'\\';
-        if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
-        out[i] = c;
-    }
-    out[src_len] = L'\0';
-
-    /* Strip trailing backslash unless root */
-    if (src_len > 3 && out[src_len - 1] == L'\\') {
-        out[src_len - 1] = L'\0';
-        src_len--;
-    }
-
-    return src_len;
+    return best;
 }
 
 /**
@@ -303,30 +328,18 @@ static BOOL check_access(const WCHAR* norm_path, int path_len,
     BOOL wants_exec   = (desired & EXEC_INTENT_MASK) != 0;
     BOOL wants_delete = (desired & DELETE_INTENT_MASK) != 0;
 
-    int best_idx = -1;
-    int best_len = 0;
+    const POLICY_RULE* rule = find_matching_rule(norm_path, path_len);
 
-    for (int i = 0; i < g_policy.rule_count; i++) {
-        POLICY_RULE* rule = &g_policy.rules[i];
-        if (is_subpath(norm_path, path_len, rule->path, rule->path_len)) {
-            if (rule->is_deny) {
-                /* Deny rules have absolute priority */
-                if (wants_write) *violation_type = VIOLATION_WRITE;
-                else if (wants_delete) *violation_type = VIOLATION_DELETE;
-                else if (wants_exec) *violation_type = VIOLATION_EXECUTE;
-                else *violation_type = VIOLATION_READ;
-                return FALSE;
-            }
-            if (rule->path_len > best_len) {
-                best_len = rule->path_len;
-                best_idx = i;
-            }
-        }
+    if (rule && rule->access == ACCESS_DENY) {
+        if (wants_write) *violation_type = VIOLATION_WRITE;
+        else if (wants_delete) *violation_type = VIOLATION_DELETE;
+        else if (wants_exec) *violation_type = VIOLATION_EXECUTE;
+        else *violation_type = VIOLATION_READ;
+        return FALSE;
     }
 
-    /* Apply best matching allow rule */
-    if (best_idx >= 0) {
-        BYTE allowed = g_policy.rules[best_idx].access;
+    if (rule) {
+        BYTE allowed = rule->access;
         if (wants_write && !(allowed & ACCESS_WRITE)) {
             *violation_type = VIOLATION_WRITE;
             return FALSE;
@@ -342,7 +355,7 @@ static BOOL check_access(const WCHAR* norm_path, int path_len,
         return TRUE;
     }
 
-    /* Default policy */
+    /* No matching rule -- apply default policy */
     if (g_policy.allow_read_all) {
         if (wants_write || wants_delete) {
             *violation_type = VIOLATION_WRITE;
@@ -354,6 +367,17 @@ static BOOL check_access(const WCHAR* norm_path, int path_len,
     /* Strict mode: deny everything not explicitly allowed */
     *violation_type = wants_write ? VIOLATION_WRITE : VIOLATION_READ;
     return FALSE;
+}
+
+/**
+ * Get the effective access level for a normalized path.
+ * Returns the ACCESS_* bitmask from the best-matching allow rule,
+ * ACCESS_READ if allow_read_all and no rule matches, or ACCESS_DENY.
+ */
+static BYTE get_path_access_level(const WCHAR* norm_path, int path_len) {
+    const POLICY_RULE* rule = find_matching_rule(norm_path, path_len);
+    if (rule) return rule->access;
+    return g_policy.allow_read_all ? ACCESS_READ : ACCESS_DENY;
 }
 
 /* ===========================================================================
@@ -372,9 +396,7 @@ static void log_violation(const WCHAR* path, int path_len, WORD access_type) {
 
     if (entry_size > log_size) return;
 
-    /* Atomically reserve space in the ring buffer using a CAS loop.
-     * This prevents the race condition where two threads read the same
-     * write_pos and overwrite each other's entries. */
+    /* Atomically reserve space in the ring buffer using a CAS loop. */
     LONG old_pos, new_pos;
     do {
         old_pos = InterlockedCompareExchange(
@@ -388,10 +410,14 @@ static void log_violation(const WCHAR* path, int path_len, WORD access_type) {
                  new_pos + (LONG)entry_size,
                  old_pos) != old_pos);
 
-    /* Build entry at reserved position */
+    /* Build entry at reserved position.
+     * Write all fields EXCEPT commit first, then path data,
+     * then set commit last with InterlockedExchange (acts as a write fence).
+     * The reader checks commit == VIOLATION_COMMIT_MAGIC to detect torn entries. */
     BYTE* base = (BYTE*)g_shm_view + log_offset + new_pos;
     VIOLATION_ENTRY* entry = (VIOLATION_ENTRY*)base;
     entry->total_size = entry_size;
+    entry->commit = 0;  /* Not yet committed */
     entry->timestamp = GetTickCount();
     entry->pid = GetCurrentProcessId();
     entry->tid = GetCurrentThreadId();
@@ -399,6 +425,9 @@ static void log_violation(const WCHAR* path, int path_len, WORD access_type) {
     entry->access_type = access_type;
 
     memcpy(base + VIOLATION_ENTRY_HDR_SIZE, path, path_bytes);
+
+    /* Commit: release-fence ensures all prior writes are visible before this */
+    InterlockedExchange((volatile LONG*)&entry->commit, VIOLATION_COMMIT_MAGIC);
 
     /* Increment violation count */
     InterlockedIncrement((volatile LONG*)&hdr->violation_count);
@@ -410,7 +439,7 @@ static void log_violation(const WCHAR* path, int path_len, WORD access_type) {
 
 /**
  * Extract file path from OBJECT_ATTRIBUTES and check access.
- * Returns STATUS_ACCESS_DENIED if blocked, or calls original otherwise.
+ * Returns STATUS_ACCESS_DENIED if blocked, or STATUS_SUCCESS to proceed.
  */
 static NTSTATUS check_file_op(POBJECT_ATTRIBUTES obj_attr, ACCESS_MASK desired) {
     if (!obj_attr || !obj_attr->ObjectName) return STATUS_SUCCESS;
@@ -421,13 +450,10 @@ static NTSTATUS check_file_op(POBJECT_ATTRIBUTES obj_attr, ACCESS_MASK desired) 
     int wchar_count = ustr->Length / sizeof(WCHAR);
 
     /* Network blocking: deny socket creation when deny_network is set.
-     * All TCP/UDP sockets go through NtCreateFile("\Device\Afd\...").
-     * Note: ICMP (ping) uses IcmpSendEcho2 via iphlpapi.dll which bypasses
-     * user-mode NtCreateFile entirely, so it cannot be blocked here. */
+     * All TCP/UDP sockets go through NtCreateFile("\Device\Afd\..."). */
     if (g_policy.deny_network) {
         const WCHAR* p = ustr->Buffer;
         int off = 0;
-        /* Skip \??\ prefix if present */
         if (wchar_count >= 4 && p[0]==L'\\' && p[1]==L'?' && p[2]==L'?' && p[3]==L'\\')
             off = 4;
         int remain = wchar_count - off;
@@ -439,14 +465,11 @@ static NTSTATUS check_file_op(POBJECT_ATTRIBUTES obj_attr, ACCESS_MASK desired) 
     }
 
     WCHAR norm_path[MAX_PATH_LENGTH];
-
-    int norm_len = normalize_nt_path(ustr->Buffer, wchar_count,
-                                     norm_path, MAX_PATH_LENGTH);
+    int norm_len = normalize_to_win32(ustr->Buffer, wchar_count,
+                                      norm_path, MAX_PATH_LENGTH);
     if (norm_len == 0) return STATUS_SUCCESS;  /* Can't normalize -> allow */
 
-    /* Only enforce policy on paths with a drive letter (e.g., "c:\...").
-     * Non-filesystem paths (pipes, devices, etc.) that slipped through
-     * normalize_nt_path should be allowed unconditionally. */
+    /* Only enforce policy on paths with a drive letter (e.g., "c:\..."). */
     if (norm_len < 3 || norm_path[1] != L':' || norm_path[2] != L'\\') {
         return STATUS_SUCCESS;
     }
@@ -496,68 +519,187 @@ static NTSTATUS NTAPI hooked_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes)
     return g_orig_NtDeleteFile(ObjectAttributes);
 }
 
+/* ===========================================================================
+ * Symlink/junction target validation
+ * =========================================================================== */
+
 /**
- * Check if a file handle corresponds to a path with write permission.
- * Uses GetFinalPathNameByHandleW to resolve the handle to a path, then
- * checks the path against the policy.
+ * Resolve a file handle to a normalized path and return its access level.
+ * Uses GetFinalPathNameByHandleW (guaranteed available on Win10+).
+ * Returns ACCESS_DENY (0) if the handle cannot be resolved.
  */
-static BOOL is_handle_in_writable_dir(HANDLE hFile) {
-    typedef DWORD (WINAPI *PFN_GetFinalPathNameByHandleW)(
-        HANDLE, LPWSTR, DWORD, DWORD);
-    static PFN_GetFinalPathNameByHandleW pfn = NULL;
-    static BOOL resolved = FALSE;
-
-    if (!resolved) {
-        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-        if (hKernel32) {
-            pfn = (PFN_GetFinalPathNameByHandleW)GetProcAddress(
-                hKernel32, "GetFinalPathNameByHandleW");
-        }
-        resolved = TRUE;
-    }
-    if (!pfn) return FALSE;
-
+static BYTE get_handle_access_level(HANDLE hFile) {
     WCHAR path_buf[MAX_PATH_LENGTH];
-    DWORD len = pfn(hFile, path_buf, MAX_PATH_LENGTH, 0 /* VOLUME_NAME_DOS */);
-    if (len == 0 || len >= MAX_PATH_LENGTH) return FALSE;
+    DWORD len = GetFinalPathNameByHandleW(hFile, path_buf, MAX_PATH_LENGTH, 0);
+    if (len == 0 || len >= MAX_PATH_LENGTH) return ACCESS_DENY;
 
-    /* Result is prefixed with "\\?\", strip it */
-    WCHAR* path = path_buf;
-    int path_len = (int)len;
-    if (path_len >= 4 && path[0] == L'\\' && path[1] == L'\\' &&
-        path[2] == L'?' && path[3] == L'\\') {
-        path += 4;
-        path_len -= 4;
-    }
-
-    /* Normalize to lowercase */
     WCHAR norm_path[MAX_PATH_LENGTH];
-    for (int i = 0; i < path_len; i++) {
-        WCHAR c = path[i];
-        if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
-        norm_path[i] = c;
-    }
-    norm_path[path_len] = L'\0';
+    int norm_len = normalize_to_win32(path_buf, (int)len, norm_path, MAX_PATH_LENGTH);
+    if (norm_len == 0) return ACCESS_DENY;
 
-    /* Check if any writable rule covers this path */
-    for (int i = 0; i < g_policy.rule_count; i++) {
-        POLICY_RULE* rule = &g_policy.rules[i];
-        if (rule->is_deny) continue;
-        if (!(rule->access & ACCESS_WRITE)) continue;
-        if (is_subpath(norm_path, path_len, rule->path, rule->path_len)) {
-            return TRUE;
-        }
+    return get_path_access_level(norm_path, norm_len);
+}
+
+/* REPARSE_DATA_BUFFER layout (from ntifs.h / winnt.h, not always available) */
+#ifndef IO_REPARSE_TAG_SYMLINK
+#define IO_REPARSE_TAG_SYMLINK  0xA000000CL
+#endif
+#ifndef IO_REPARSE_TAG_MOUNT_POINT
+#define IO_REPARSE_TAG_MOUNT_POINT 0xA0000003L
+#endif
+
+typedef struct _REPARSE_DATA_HDR {
+    ULONG  ReparseTag;
+    USHORT ReparseDataLength;
+    USHORT Reserved;
+} REPARSE_DATA_HDR;
+
+typedef struct _SYMLINK_REPARSE_BUFFER {
+    USHORT SubstituteNameOffset;
+    USHORT SubstituteNameLength;
+    USHORT PrintNameOffset;
+    USHORT PrintNameLength;
+    ULONG  Flags;  /* SYMLINK_FLAG_RELATIVE = 0x01 */
+    /* WCHAR PathBuffer[] follows */
+} SYMLINK_REPARSE_BUFFER;
+
+typedef struct _MOUNT_POINT_REPARSE_BUFFER {
+    USHORT SubstituteNameOffset;
+    USHORT SubstituteNameLength;
+    USHORT PrintNameOffset;
+    USHORT PrintNameLength;
+    /* WCHAR PathBuffer[] follows */
+} MOUNT_POINT_REPARSE_BUFFER;
+
+#define SYMLINK_FLAG_RELATIVE 0x01
+
+/**
+ * Extract the symlink/junction target path from a REPARSE_DATA_BUFFER.
+ * Returns the normalized target path length, or 0 if extraction fails.
+ *
+ * For relative symlinks, the target is resolved relative to the source
+ * directory (resolved from FileHandle) and canonicalized via GetFullPathNameW
+ * to properly resolve ".." and "." components.
+ */
+static int extract_reparse_target(
+    PVOID InputBuffer, ULONG InputBufferLength,
+    HANDLE FileHandle,
+    WCHAR* out_path, int out_max)
+{
+    if (!InputBuffer || InputBufferLength < sizeof(REPARSE_DATA_HDR))
+        return 0;
+
+    REPARSE_DATA_HDR* hdr = (REPARSE_DATA_HDR*)InputBuffer;
+    BYTE* data_start = (BYTE*)InputBuffer + sizeof(REPARSE_DATA_HDR);
+    ULONG data_avail = InputBufferLength - sizeof(REPARSE_DATA_HDR);
+
+    const WCHAR* sub_name = NULL;
+    USHORT sub_name_len = 0;  /* in bytes */
+    BOOL is_relative = FALSE;
+
+    if (hdr->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
+        if (data_avail < sizeof(SYMLINK_REPARSE_BUFFER)) return 0;
+        SYMLINK_REPARSE_BUFFER* sym = (SYMLINK_REPARSE_BUFFER*)data_start;
+        BYTE* path_buf = data_start + sizeof(SYMLINK_REPARSE_BUFFER);
+        ULONG path_buf_avail = data_avail - sizeof(SYMLINK_REPARSE_BUFFER);
+
+        if (sym->SubstituteNameOffset + sym->SubstituteNameLength > path_buf_avail)
+            return 0;
+
+        sub_name = (const WCHAR*)(path_buf + sym->SubstituteNameOffset);
+        sub_name_len = sym->SubstituteNameLength;
+        is_relative = (sym->Flags & SYMLINK_FLAG_RELATIVE) != 0;
+
+    } else if (hdr->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
+        if (data_avail < sizeof(MOUNT_POINT_REPARSE_BUFFER)) return 0;
+        MOUNT_POINT_REPARSE_BUFFER* mnt = (MOUNT_POINT_REPARSE_BUFFER*)data_start;
+        BYTE* path_buf = data_start + sizeof(MOUNT_POINT_REPARSE_BUFFER);
+        ULONG path_buf_avail = data_avail - sizeof(MOUNT_POINT_REPARSE_BUFFER);
+
+        if (mnt->SubstituteNameOffset + mnt->SubstituteNameLength > path_buf_avail)
+            return 0;
+
+        sub_name = (const WCHAR*)(path_buf + mnt->SubstituteNameOffset);
+        sub_name_len = mnt->SubstituteNameLength;
+        is_relative = FALSE;  /* Junctions are always absolute */
+
+    } else {
+        return 0;  /* Unknown reparse tag, can't validate */
     }
-    return FALSE;
+
+    int sub_wchar_count = sub_name_len / sizeof(WCHAR);
+    if (sub_wchar_count <= 0) return 0;
+
+    WCHAR full_path[MAX_PATH_LENGTH];
+
+    if (is_relative) {
+        /* Resolve relative path against the parent directory of the symlink.
+         * FileHandle points to the reparse point itself (the symlink being
+         * created), so we must strip the last component to get the parent. */
+        WCHAR dir_buf[MAX_PATH_LENGTH];
+        DWORD dir_len = GetFinalPathNameByHandleW(FileHandle, dir_buf, MAX_PATH_LENGTH, 0);
+        if (dir_len == 0 || dir_len >= MAX_PATH_LENGTH) return 0;
+
+        /* Strip \\?\ prefix from GetFinalPathNameByHandleW result */
+        WCHAR* dir = dir_buf;
+        int dlen = (int)dir_len;
+        if (dlen >= 4 && dir[0] == L'\\' && dir[1] == L'\\' &&
+            dir[2] == L'?' && dir[3] == L'\\') {
+            dir += 4;
+            dlen -= 4;
+        }
+
+        /* Strip last path component (the symlink name) to get parent dir.
+         * Relative symlink targets are resolved relative to the parent
+         * directory, not relative to the symlink path itself. */
+        while (dlen > 0 && dir[dlen - 1] != L'\\') dlen--;
+        /* dlen now includes the trailing backslash, or is 0 if no separator */
+        if (dlen == 0) return 0;
+        dir[dlen] = L'\0';
+
+        /* Concatenate dir + relative target */
+        if (dlen + sub_wchar_count >= MAX_PATH_LENGTH) return 0;
+        memcpy(full_path, dir, dlen * sizeof(WCHAR));
+        memcpy(full_path + dlen, sub_name, sub_wchar_count * sizeof(WCHAR));
+        full_path[dlen + sub_wchar_count] = L'\0';
+
+        /* Canonicalize to resolve ".." and "." components (security fix).
+         * GetFullPathNameW is purely lexical -- no filesystem access needed. */
+        WCHAR canonical[MAX_PATH_LENGTH];
+        DWORD canon_len = GetFullPathNameW(full_path, MAX_PATH_LENGTH, canonical, NULL);
+        if (canon_len == 0 || canon_len >= MAX_PATH_LENGTH) return 0;
+
+        return normalize_to_win32(canonical, (int)canon_len, out_path, out_max);
+
+    } else {
+        /* Absolute path: normalize directly (handles \??\ prefix stripping) */
+        int norm_len = normalize_to_win32(sub_name, sub_wchar_count, full_path, MAX_PATH_LENGTH);
+        if (norm_len == 0) return 0;
+
+        /* Only validate paths with drive letters */
+        if (norm_len < 3 || full_path[1] != L':' || full_path[2] != L'\\') {
+            return 0;
+        }
+
+        if (norm_len >= out_max) return 0;
+        wcscpy_s(out_path, out_max, full_path);
+        return norm_len;
+    }
 }
 
 /**
- * Hook NtFsControlFile to block symlink/junction creation.
+ * Hook NtFsControlFile to validate symlink/junction creation.
  * FSCTL_SET_REPARSE_POINT is the ioctl used by mklink /D, mklink /J, and
- * CreateSymbolicLink(). Blocking this prevents symlink-based sandbox escapes
- * where a link inside an allowed directory points to a denied path.
+ * CreateSymbolicLink().
  *
- * Symlinks are allowed within writable directories (e.g., npm link in workspace).
+ * Policy: symlink creation is allowed only if:
+ *   1. The source directory (where the symlink is placed) has write access.
+ *   2. The target path's access level >= source path's access level.
+ *      (e.g., rw -> rw is OK; r -> rw is OK; rw -> r is DENIED)
+ *
+ * This prevents privilege escalation via symlinks: a writable directory cannot
+ * create a symlink pointing to a read-only or denied path, because that would
+ * allow writing through the symlink to a less-privileged location.
  */
 static NTSTATUS NTAPI hooked_NtFsControlFile(
     HANDLE FileHandle, HANDLE Event,
@@ -567,13 +709,38 @@ static NTSTATUS NTAPI hooked_NtFsControlFile(
     PVOID OutputBuffer, ULONG OutputBufferLength)
 {
     if (FsControlCode == FSCTL_SET_REPARSE_POINT) {
-        /* Allow symlink creation within writable directories */
-        if (is_handle_in_writable_dir(FileHandle)) {
-            DBG("SYMLINK ALLOWED: target is in writable directory");
-        } else {
-            DBG("SYMLINK DENIED: FSCTL_SET_REPARSE_POINT blocked");
+        /* Step 1: Check that source directory is writable */
+        BYTE source_access = get_handle_access_level(FileHandle);
+        if (!(source_access & ACCESS_WRITE)) {
+            DBG("SYMLINK DENIED: source directory is not writable");
             log_violation(L"<symlink>", 9, VIOLATION_SYMLINK);
             return (NTSTATUS)0xC0000022L;  /* STATUS_ACCESS_DENIED */
+        }
+
+        /* Step 2: Extract and validate target path */
+        WCHAR target_path[MAX_PATH_LENGTH];
+        int target_len = extract_reparse_target(
+            InputBuffer, InputBufferLength, FileHandle,
+            target_path, MAX_PATH_LENGTH);
+
+        if (target_len > 0) {
+            BYTE target_access = get_path_access_level(target_path, target_len);
+
+            /* Target's access must be >= source's access.
+             * Every access bit set in source must also be set in target. */
+            if ((source_access & ~target_access) != 0) {
+                DBG("SYMLINK DENIED: target access (0x%02X) < source access (0x%02X), "
+                    "target=%ls", target_access, source_access, target_path);
+                log_violation(target_path, target_len, VIOLATION_SYMLINK);
+                return (NTSTATUS)0xC0000022L;  /* STATUS_ACCESS_DENIED */
+            }
+
+            DBG("SYMLINK ALLOWED: source=0x%02X, target=0x%02X, path=%ls",
+                source_access, target_access, target_path);
+        } else {
+            /* Cannot extract target (unknown reparse format or parse failure).
+             * Allow if source is writable (already checked above). */
+            DBG("SYMLINK ALLOWED: could not extract target, source is writable");
         }
     }
 
@@ -666,10 +833,8 @@ static BOOL WINAPI hooked_CreateProcessW(
         lpStartupInfo, lpProcessInformation);
 
     if (result && lpProcessInformation) {
-        /* Inject our DLL into the child process */
         inject_dll_into_process(lpProcessInformation->hProcess);
 
-        /* Resume the child's main thread if it wasn't originally suspended */
         if (!was_suspended) {
             ResumeThread(lpProcessInformation->hThread);
         }
@@ -810,9 +975,8 @@ static BOOL init_shared_memory(void) {
     WCHAR env_dll_path[MAX_PATH];
     DWORD dll_len = GetEnvironmentVariableW(SANDBOX_DLL_PATH_VAR, env_dll_path, MAX_PATH);
     if (dll_len > 0 && dll_len < MAX_PATH) {
-        memcpy(g_dll_path, env_dll_path, (dll_len + 1) * sizeof(WCHAR));
+        wcscpy_s(g_dll_path, MAX_PATH, env_dll_path);
     }
-    /* Otherwise keep g_dll_path set by DllMain (correct module path) */
 
     /* Check debug flag */
     WCHAR dbg_buf[8];
@@ -822,7 +986,8 @@ static BOOL init_shared_memory(void) {
 
     /* Open shared memory */
     WCHAR shm_name[128];
-    _snwprintf(shm_name, 128, L"%s%s", SANDBOX_SHM_PREFIX, g_session_id);
+    _snwprintf_s(shm_name, _countof(shm_name), _TRUNCATE,
+                 L"%s%s", SANDBOX_SHM_PREFIX, g_session_id);
 
     g_shm_handle = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, shm_name);
     if (!g_shm_handle) {
