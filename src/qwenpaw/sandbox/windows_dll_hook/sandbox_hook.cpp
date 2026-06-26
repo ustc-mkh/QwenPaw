@@ -1,5 +1,5 @@
 /**
- * sandbox_hook.c - QwenPaw DLL-based sandbox hook implementation
+ * sandbox_hook.cpp - QwenPaw DLL-based sandbox hook implementation
  *
  * This DLL is injected into the target process (and all its children) to
  * enforce filesystem access policies. It hooks:
@@ -21,18 +21,20 @@
  *   variable. The DLL reads the policy from named shared memory on attach.
  *   The DLL path is passed via __QWENPAW_SANDBOX_DLL_PATH for child injection.
  *
- * Build: MSVC x64 or MinGW-w64 x64
- *   cl /O2 /LD sandbox_hook.c /link /OUT:sandbox_hook.dll
- *   x86_64-w64-mingw32-gcc -shared -O2 -o sandbox_hook.dll sandbox_hook.c
+ * Dependencies: Microsoft Detours (hooking), cJSON (policy parsing)
+ * Build: cmake with vcpkg toolchain (see build.bat)
  */
 
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <winternl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <detours/detours.h>
+#include <cjson/cJSON.h>
 
 #include "sandbox_hook.h"
 
@@ -128,22 +130,13 @@ static WCHAR g_session_id[64];         /* Session ID from env */
 static BOOL g_hooks_installed = FALSE;
 static BOOL g_debug = FALSE;
 
-/* Original function pointers (trampolines) */
+/* Original function pointers -- populated by DetourAttach */
 static PFN_NtCreateFile    g_orig_NtCreateFile = NULL;
 static PFN_NtOpenFile      g_orig_NtOpenFile = NULL;
 static PFN_NtDeleteFile    g_orig_NtDeleteFile = NULL;
 static PFN_NtFsControlFile g_orig_NtFsControlFile = NULL;
 static PFN_CreateProcessW  g_orig_CreateProcessW = NULL;
 static PFN_CreateProcessA  g_orig_CreateProcessA = NULL;
-
-/* Trampoline buffers (allocated with VirtualAlloc, RWX) */
-#define TRAMPOLINE_SIZE 64
-static BYTE* g_tramp_NtCreateFile = NULL;
-static BYTE* g_tramp_NtOpenFile = NULL;
-static BYTE* g_tramp_NtDeleteFile = NULL;
-static BYTE* g_tramp_NtFsControlFile = NULL;
-static BYTE* g_tramp_CreateProcessW = NULL;
-static BYTE* g_tramp_CreateProcessA = NULL;
 
 /* ===========================================================================
  * Debug logging
@@ -159,80 +152,8 @@ static BYTE* g_tramp_CreateProcessA = NULL;
 } while(0)
 
 /* ===========================================================================
- * Minimal JSON parser (just enough for our policy format)
+ * Policy JSON parsing (cJSON)
  * =========================================================================== */
-
-static const char* skip_ws(const char* p) {
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    return p;
-}
-
-static const char* parse_string(const char* p, char* out, int max_len) {
-    if (*p != '"') return NULL;
-    p++;
-    int i = 0;
-    while (*p && *p != '"' && i < max_len - 1) {
-        if (*p == '\\') {
-            p++;
-            if (*p == '\\') out[i++] = '\\';
-            else if (*p == '"') out[i++] = '"';
-            else if (*p == '/') out[i++] = '/';
-            else if (*p == 'n') out[i++] = '\n';
-            else if (*p == 't') out[i++] = '\t';
-            else out[i++] = *p;
-        } else {
-            out[i++] = *p;
-        }
-        p++;
-    }
-    out[i] = '\0';
-    if (*p == '"') p++;
-    return p;
-}
-
-static const char* skip_value(const char* p) {
-    p = skip_ws(p);
-    if (*p == '"') {
-        p++;
-        while (*p && *p != '"') {
-            if (*p == '\\') p++;
-            p++;
-        }
-        if (*p == '"') p++;
-    } else if (*p == '{') {
-        int depth = 1;
-        p++;
-        while (*p && depth > 0) {
-            if (*p == '{') depth++;
-            else if (*p == '}') depth--;
-            else if (*p == '"') {
-                p++;
-                while (*p && *p != '"') { if (*p == '\\') p++; p++; }
-            }
-            p++;
-        }
-    } else if (*p == '[') {
-        int depth = 1;
-        p++;
-        while (*p && depth > 0) {
-            if (*p == '[') depth++;
-            else if (*p == ']') depth--;
-            else if (*p == '"') {
-                p++;
-                while (*p && *p != '"') { if (*p == '\\') p++; p++; }
-            }
-            p++;
-        }
-    } else {
-        while (*p && *p != ',' && *p != '}' && *p != ']') p++;
-    }
-    return p;
-}
-
-static BOOL parse_bool(const char* p) {
-    p = skip_ws(p);
-    return (strncmp(p, "true", 4) == 0);
-}
 
 /* Normalize path: lowercase, forward slash -> backslash, strip trailing backslash */
 static void normalize_path_to_wchar(const char* utf8_path, WCHAR* out, int max_wchars) {
@@ -257,95 +178,62 @@ static void normalize_path_to_wchar(const char* utf8_path, WCHAR* out, int max_w
 static BOOL parse_policy_json(const char* json, SANDBOX_POLICY* policy) {
     memset(policy, 0, sizeof(SANDBOX_POLICY));
 
-    const char* p = skip_ws(json);
-    if (*p != '{') return FALSE;
-    p++;
+    cJSON* root = cJSON_Parse(json);
+    if (!root) {
+        DBG("cJSON_Parse failed: %s",
+            cJSON_GetErrorPtr() ? cJSON_GetErrorPtr() : "unknown");
+        return FALSE;
+    }
 
-    char key[64];
-    while (*p && *p != '}') {
-        p = skip_ws(p);
-        if (*p == ',') { p++; continue; }
-        if (*p != '"') break;
+    cJSON* allow_read_all = cJSON_GetObjectItemCaseSensitive(root, "allow_read_all");
+    if (cJSON_IsBool(allow_read_all)) {
+        policy->allow_read_all = cJSON_IsTrue(allow_read_all);
+    }
 
-        p = parse_string(p, key, sizeof(key));
-        if (!p) break;
-        p = skip_ws(p);
-        if (*p != ':') break;
-        p++;
-        p = skip_ws(p);
+    cJSON* deny_network = cJSON_GetObjectItemCaseSensitive(root, "deny_network");
+    if (cJSON_IsBool(deny_network)) {
+        policy->deny_network = cJSON_IsTrue(deny_network);
+    }
 
-        if (strcmp(key, "allow_read_all") == 0) {
-            policy->allow_read_all = parse_bool(p);
-            p = skip_value(p);
-        } else if (strcmp(key, "deny_network") == 0) {
-            policy->deny_network = parse_bool(p);
-            p = skip_value(p);
-        } else if (strcmp(key, "rules") == 0) {
-            if (*p != '[') { p = skip_value(p); continue; }
-            p++;  /* skip '[' */
+    cJSON* rules = cJSON_GetObjectItemCaseSensitive(root, "rules");
+    if (cJSON_IsArray(rules)) {
+        cJSON* rule_item = NULL;
+        cJSON_ArrayForEach(rule_item, rules) {
+            if (policy->rule_count >= MAX_POLICY_RULES) break;
 
-            while (*p && *p != ']') {
-                p = skip_ws(p);
-                if (*p == ',') { p++; continue; }
-                if (*p != '{') break;
-                p++;  /* skip '{' */
+            cJSON* path_item = cJSON_GetObjectItemCaseSensitive(rule_item, "path");
+            cJSON* access_item = cJSON_GetObjectItemCaseSensitive(rule_item, "access");
 
-                char rule_path[1024] = {0};
-                char rule_access[16] = {0};
+            if (!cJSON_IsString(path_item) || !path_item->valuestring[0])
+                continue;
 
-                while (*p && *p != '}') {
-                    p = skip_ws(p);
-                    if (*p == ',') { p++; continue; }
-                    if (*p != '"') break;
+            POLICY_RULE* rule = &policy->rules[policy->rule_count];
 
-                    char rkey[32];
-                    p = parse_string(p, rkey, sizeof(rkey));
-                    if (!p) break;
-                    p = skip_ws(p);
-                    if (*p != ':') break;
-                    p++;
-                    p = skip_ws(p);
+            normalize_path_to_wchar(path_item->valuestring, rule->path, MAX_PATH_LENGTH);
+            rule->path_len = (int)wcslen(rule->path);
 
-                    if (strcmp(rkey, "path") == 0) {
-                        p = parse_string(p, rule_path, sizeof(rule_path));
-                    } else if (strcmp(rkey, "access") == 0) {
-                        p = parse_string(p, rule_access, sizeof(rule_access));
-                    } else {
-                        p = skip_value(p);
-                    }
-                }
-                if (*p == '}') p++;
+            const char* access_str = cJSON_IsString(access_item)
+                                         ? access_item->valuestring : "r";
 
-                /* Add rule to policy */
-                if (rule_path[0] && policy->rule_count < MAX_POLICY_RULES) {
-                    POLICY_RULE* rule = &policy->rules[policy->rule_count];
-
-                    normalize_path_to_wchar(rule_path, rule->path, MAX_PATH_LENGTH);
-                    rule->path_len = (int)wcslen(rule->path);
-
-                    if (strcmp(rule_access, "deny") == 0) {
-                        rule->access = ACCESS_DENY;
-                        rule->is_deny = 1;
-                    } else if (strcmp(rule_access, "rw") == 0) {
-                        rule->access = ACCESS_FULL;
-                        rule->is_deny = 0;
-                    } else if (strcmp(rule_access, "rx") == 0) {
-                        rule->access = ACCESS_READ_EXECUTE;
-                        rule->is_deny = 0;
-                    } else {
-                        rule->access = ACCESS_READ;
-                        rule->is_deny = 0;
-                    }
-
-                    policy->rule_count++;
-                }
+            if (strcmp(access_str, "deny") == 0) {
+                rule->access = ACCESS_DENY;
+                rule->is_deny = 1;
+            } else if (strcmp(access_str, "rw") == 0) {
+                rule->access = ACCESS_FULL;
+                rule->is_deny = 0;
+            } else if (strcmp(access_str, "rx") == 0) {
+                rule->access = ACCESS_READ_EXECUTE;
+                rule->is_deny = 0;
+            } else {
+                rule->access = ACCESS_READ;
+                rule->is_deny = 0;
             }
-            if (*p == ']') p++;
-        } else {
-            p = skip_value(p);
+
+            policy->rule_count++;
         }
     }
 
+    cJSON_Delete(root);
     return TRUE;
 }
 
@@ -514,206 +402,6 @@ static void log_violation(const WCHAR* path, int path_len, WORD access_type) {
 
     /* Increment violation count */
     InterlockedIncrement((volatile LONG*)&hdr->violation_count);
-}
-
-/* ===========================================================================
- * Inline hook engine (x64 E9 relay)
- * =========================================================================== */
-
-/**
- * Minimal x64 instruction length decoder for function prologues.
- * Returns length of instruction at code[0], or 0 if unknown.
- *
- * Also detects RIP-relative addressing via the is_rip_relative out param.
- * Callers must handle RIP-relative instructions specially when relocating.
- */
-static int x64_insn_length(const BYTE* code, BOOL* is_rip_relative) {
-    const BYTE* p = code;
-    BOOL rex_w = FALSE;
-    *is_rip_relative = FALSE;
-
-    /* Handle ENDBR64: F3 0F 1E FA (Intel CET) */
-    if (p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x1E && p[3] == 0xFA) {
-        return 4;
-    }
-
-    /* Skip prefixes */
-    while (1) {
-        if (*p >= 0x40 && *p <= 0x4F) { rex_w = (*p & 0x08) != 0; p++; }
-        else if (*p == 0x66 || *p == 0x67) { p++; }
-        else if (*p == 0xF3 || *p == 0xF2) { p++; }  /* REP/REPNE prefix */
-        else break;
-    }
-
-    BYTE opcode = *p++;
-
-    /* PUSH/POP reg */
-    if (opcode >= 0x50 && opcode <= 0x5F) return (int)(p - code);
-    /* RET, NOP, INT3 */
-    if (opcode == 0xC3 || opcode == 0x90 || opcode == 0xCC) return (int)(p - code);
-    /* MOV reg, imm32/imm64 */
-    if (opcode >= 0xB8 && opcode <= 0xBF) return (int)(p - code) + (rex_w ? 8 : 4);
-    /* Jcc short */
-    if (opcode >= 0x70 && opcode <= 0x7F) return (int)(p - code) + 1;
-    /* JMP short */
-    if (opcode == 0xEB) return (int)(p - code) + 1;
-    /* JMP/CALL rel32 */
-    if (opcode == 0xE9 || opcode == 0xE8) return (int)(p - code) + 4;
-
-    /* Two-byte opcode 0F xx */
-    if (opcode == 0x0F) {
-        BYTE op2 = *p++;
-        if (op2 == 0x05) return (int)(p - code);  /* SYSCALL */
-        if (op2 == 0x1E) { p++; return (int)(p - code); }  /* ENDBR32/64 (0F 1E xx) */
-        if (op2 >= 0x80 && op2 <= 0x8F) return (int)(p - code) + 4;  /* Jcc near */
-        return 0;
-    }
-
-    /* ModRM-based opcodes */
-    static const BYTE modrm_ops[] = {
-        0x01, 0x03, 0x09, 0x0B, 0x21, 0x23, 0x29, 0x2B,
-        0x31, 0x33, 0x39, 0x3B, 0x63, 0x85, 0x87, 0x89, 0x8B, 0x8D, 0
-    };
-    BOOL is_modrm = FALSE;
-    for (int i = 0; modrm_ops[i]; i++) {
-        if (opcode == modrm_ops[i]) { is_modrm = TRUE; break; }
-    }
-
-    /* Group opcodes */
-    BOOL is_group = (opcode == 0x80 || opcode == 0x81 || opcode == 0x83 ||
-                     opcode == 0xC7 || opcode == 0xF6 || opcode == 0xF7);
-
-    if (is_modrm || is_group) {
-        BYTE modrm = *p++;
-        BYTE mod = (modrm >> 6) & 3;
-        BYTE rm  = modrm & 7;
-
-        if (mod != 3 && rm == 4) p++;  /* SIB byte */
-        if (mod == 1) p += 1;          /* disp8 */
-        else if (mod == 2) p += 4;     /* disp32 */
-        else if (mod == 0 && rm == 5) {
-            p += 4; /* RIP-rel disp32 */
-            *is_rip_relative = TRUE;
-        }
-
-        /* Immediate for group opcodes */
-        if (is_group) {
-            BYTE reg_op = (modrm >> 3) & 7;
-            if (opcode == 0x80) p += 1;
-            else if (opcode == 0x81) p += 4;
-            else if (opcode == 0x83) p += 1;
-            else if (opcode == 0xC7) p += 4;
-            else if (opcode == 0xF6 && reg_op <= 1) p += 1;
-            else if (opcode == 0xF7 && reg_op <= 1) p += 4;
-        }
-
-        return (int)(p - code);
-    }
-
-    return 0;
-}
-
-/**
- * Calculate minimum bytes to copy for trampoline (instruction-aligned >= 5).
- * Returns 0 if the prologue contains RIP-relative instructions (which cannot
- * be safely relocated without fixups) or unknown instructions.
- */
-static int calc_trampoline_copy_size(const BYTE* code) {
-    int total = 0;
-    while (total < 5) {
-        BOOL is_rip_relative = FALSE;
-        int len = x64_insn_length(code + total, &is_rip_relative);
-        if (len == 0) return 0;
-        if (is_rip_relative) {
-            DBG("RIP-relative instruction at offset %d, cannot relocate", total);
-            return 0;
-        }
-        total += len;
-    }
-    return total;
-}
-
-/**
- * Allocate executable memory near target (within +/-2GB for E9 rel32).
- */
-static BYTE* alloc_near(void* target, SIZE_T size) {
-    ULONG_PTR base = (ULONG_PTR)target;
-    DWORD granularity = 0x10000;  /* 64KB */
-
-    for (int step = 1; step < 0x7FFF; step++) {
-        for (int dir = -1; dir <= 1; dir += 2) {
-            ULONG_PTR candidate = base + (ULONG_PTR)(dir * step * granularity);
-            candidate &= ~((ULONG_PTR)granularity - 1);
-            if (candidate == 0 || candidate > 0x7FFFFFFFFFFF) continue;
-
-            BYTE* addr = (BYTE*)VirtualAlloc(
-                (LPVOID)candidate, size,
-                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-            if (addr) {
-                LONGLONG diff = (LONGLONG)addr - (LONGLONG)((BYTE*)target + 5);
-                if (diff >= -0x80000000LL && diff < 0x7FFFFFFFLL) {
-                    return addr;
-                }
-                VirtualFree(addr, 0, MEM_RELEASE);
-            }
-        }
-    }
-    return NULL;
-}
-
-/**
- * Install a single inline hook.
- * Returns the trampoline pointer (callable as original function) or NULL.
- */
-static BYTE* install_hook(void* target, void* detour, BYTE* trampoline_buf) {
-    BYTE* func = (BYTE*)target;
-
-    /* Handle existing E9 hook (AV/EDR) */
-    if (func[0] == 0xE9) {
-        INT32 rel32;
-        memcpy(&rel32, func + 1, 4);
-        BYTE* third_party = func + 5 + rel32;
-
-        /* Trampoline: absolute JMP to third-party target */
-        trampoline_buf[0] = 0xFF;
-        trampoline_buf[1] = 0x25;
-        *(DWORD*)(trampoline_buf + 2) = 0;
-        *(UINT64*)(trampoline_buf + 6) = (UINT64)third_party;
-    } else {
-        /* Standard: copy prologue + JMP back */
-        int copy_size = calc_trampoline_copy_size(func);
-        if (copy_size == 0) return NULL;
-
-        memcpy(trampoline_buf, func, copy_size);
-        /* Absolute JMP back to func + copy_size */
-        trampoline_buf[copy_size] = 0xFF;
-        trampoline_buf[copy_size + 1] = 0x25;
-        *(DWORD*)(trampoline_buf + copy_size + 2) = 0;
-        *(UINT64*)(trampoline_buf + copy_size + 6) = (UINT64)(func + copy_size);
-    }
-
-    /* Allocate relay near target for E9 */
-    BYTE* relay = alloc_near(target, 64);
-    if (!relay) return NULL;
-
-    /* Relay: absolute JMP to detour */
-    relay[0] = 0xFF;
-    relay[1] = 0x25;
-    *(DWORD*)(relay + 2) = 0;
-    *(UINT64*)(relay + 6) = (UINT64)detour;
-
-    /* Patch target: E9 rel32 -> relay */
-    DWORD old_prot;
-    VirtualProtect(func, 5, PAGE_EXECUTE_READWRITE, &old_prot);
-
-    INT32 disp = (INT32)((BYTE*)relay - (func + 5));
-    func[0] = 0xE9;
-    memcpy(func + 1, &disp, 4);
-
-    VirtualProtect(func, 5, old_prot, &old_prot);
-    FlushInstructionCache(GetCurrentProcess(), func, 5);
-
-    return trampoline_buf;
 }
 
 /* ===========================================================================
@@ -1023,7 +711,7 @@ static BOOL WINAPI hooked_CreateProcessA(
 }
 
 /* ===========================================================================
- * Hook installation / removal
+ * Hook installation / removal (Microsoft Detours)
  * =========================================================================== */
 
 static BOOL install_all_hooks(void) {
@@ -1035,71 +723,73 @@ static BOOL install_all_hooks(void) {
         return FALSE;
     }
 
-    /* Allocate trampolines (RWX) */
-    g_tramp_NtCreateFile = (BYTE*)VirtualAlloc(NULL, TRAMPOLINE_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    g_tramp_NtOpenFile = (BYTE*)VirtualAlloc(NULL, TRAMPOLINE_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    g_tramp_NtDeleteFile = (BYTE*)VirtualAlloc(NULL, TRAMPOLINE_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    g_tramp_NtFsControlFile = (BYTE*)VirtualAlloc(NULL, TRAMPOLINE_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    g_tramp_CreateProcessW = (BYTE*)VirtualAlloc(NULL, TRAMPOLINE_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    g_tramp_CreateProcessA = (BYTE*)VirtualAlloc(NULL, TRAMPOLINE_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    /* Resolve original function addresses */
+    g_orig_NtCreateFile = (PFN_NtCreateFile)GetProcAddress(hNtdll, "NtCreateFile");
+    g_orig_NtOpenFile = (PFN_NtOpenFile)GetProcAddress(hNtdll, "NtOpenFile");
+    g_orig_NtDeleteFile = (PFN_NtDeleteFile)GetProcAddress(hNtdll, "NtDeleteFile");
+    g_orig_NtFsControlFile = (PFN_NtFsControlFile)GetProcAddress(hNtdll, "NtFsControlFile");
+    g_orig_CreateProcessW = (PFN_CreateProcessW)GetProcAddress(hKernel32, "CreateProcessW");
+    g_orig_CreateProcessA = (PFN_CreateProcessA)GetProcAddress(hKernel32, "CreateProcessA");
 
-    if (!g_tramp_NtCreateFile || !g_tramp_NtOpenFile || !g_tramp_NtDeleteFile ||
-        !g_tramp_NtFsControlFile || !g_tramp_CreateProcessW || !g_tramp_CreateProcessA) {
-        DBG("Failed to allocate trampolines");
-        /* Free any successfully allocated buffers */
-        if (g_tramp_NtCreateFile) { VirtualFree(g_tramp_NtCreateFile, 0, MEM_RELEASE); g_tramp_NtCreateFile = NULL; }
-        if (g_tramp_NtOpenFile) { VirtualFree(g_tramp_NtOpenFile, 0, MEM_RELEASE); g_tramp_NtOpenFile = NULL; }
-        if (g_tramp_NtDeleteFile) { VirtualFree(g_tramp_NtDeleteFile, 0, MEM_RELEASE); g_tramp_NtDeleteFile = NULL; }
-        if (g_tramp_NtFsControlFile) { VirtualFree(g_tramp_NtFsControlFile, 0, MEM_RELEASE); g_tramp_NtFsControlFile = NULL; }
-        if (g_tramp_CreateProcessW) { VirtualFree(g_tramp_CreateProcessW, 0, MEM_RELEASE); g_tramp_CreateProcessW = NULL; }
-        if (g_tramp_CreateProcessA) { VirtualFree(g_tramp_CreateProcessA, 0, MEM_RELEASE); g_tramp_CreateProcessA = NULL; }
+    /* Begin Detours transaction */
+    DetourRestoreAfterWith();
+
+    LONG error = DetourTransactionBegin();
+    if (error != NO_ERROR) {
+        DBG("DetourTransactionBegin failed: %ld", error);
         return FALSE;
     }
 
-    /* Resolve function addresses */
-    FARPROC pNtCreateFile = GetProcAddress(hNtdll, "NtCreateFile");
-    FARPROC pNtOpenFile = GetProcAddress(hNtdll, "NtOpenFile");
-    FARPROC pNtDeleteFile = GetProcAddress(hNtdll, "NtDeleteFile");
-    FARPROC pNtFsControlFile = GetProcAddress(hNtdll, "NtFsControlFile");
-    FARPROC pCreateProcessW = GetProcAddress(hKernel32, "CreateProcessW");
-    FARPROC pCreateProcessA = GetProcAddress(hKernel32, "CreateProcessA");
+    DetourUpdateThread(GetCurrentThread());
 
-    int hook_count = 0;
+    /* Attach each hook */
+    if (g_orig_NtCreateFile)
+        DetourAttach(reinterpret_cast<PVOID*>(&g_orig_NtCreateFile), hooked_NtCreateFile);
+    if (g_orig_NtOpenFile)
+        DetourAttach(reinterpret_cast<PVOID*>(&g_orig_NtOpenFile), hooked_NtOpenFile);
+    if (g_orig_NtDeleteFile)
+        DetourAttach(reinterpret_cast<PVOID*>(&g_orig_NtDeleteFile), hooked_NtDeleteFile);
+    if (g_orig_NtFsControlFile)
+        DetourAttach(reinterpret_cast<PVOID*>(&g_orig_NtFsControlFile), hooked_NtFsControlFile);
+    if (g_orig_CreateProcessW)
+        DetourAttach(reinterpret_cast<PVOID*>(&g_orig_CreateProcessW), hooked_CreateProcessW);
+    if (g_orig_CreateProcessA)
+        DetourAttach(reinterpret_cast<PVOID*>(&g_orig_CreateProcessA), hooked_CreateProcessA);
 
-    if (pNtCreateFile) {
-        BYTE* t = install_hook(pNtCreateFile, hooked_NtCreateFile, g_tramp_NtCreateFile);
-        if (t) { g_orig_NtCreateFile = (PFN_NtCreateFile)t; hook_count++; }
-    }
-    if (pNtOpenFile) {
-        BYTE* t = install_hook(pNtOpenFile, hooked_NtOpenFile, g_tramp_NtOpenFile);
-        if (t) { g_orig_NtOpenFile = (PFN_NtOpenFile)t; hook_count++; }
-    }
-    if (pNtDeleteFile) {
-        BYTE* t = install_hook(pNtDeleteFile, hooked_NtDeleteFile, g_tramp_NtDeleteFile);
-        if (t) { g_orig_NtDeleteFile = (PFN_NtDeleteFile)t; hook_count++; }
-    }
-    if (pNtFsControlFile) {
-        BYTE* t = install_hook(pNtFsControlFile, hooked_NtFsControlFile, g_tramp_NtFsControlFile);
-        if (t) { g_orig_NtFsControlFile = (PFN_NtFsControlFile)t; hook_count++; }
-    }
-    if (pCreateProcessW) {
-        BYTE* t = install_hook(pCreateProcessW, hooked_CreateProcessW, g_tramp_CreateProcessW);
-        if (t) { g_orig_CreateProcessW = (PFN_CreateProcessW)t; hook_count++; }
-    }
-    if (pCreateProcessA) {
-        BYTE* t = install_hook(pCreateProcessA, hooked_CreateProcessA, g_tramp_CreateProcessA);
-        if (t) { g_orig_CreateProcessA = (PFN_CreateProcessA)t; hook_count++; }
+    /* Commit -- atomically patches all targets */
+    error = DetourTransactionCommit();
+    if (error != NO_ERROR) {
+        DBG("DetourTransactionCommit failed: %ld", error);
+        return FALSE;
     }
 
-    DBG("Installed %d/6 hooks", hook_count);
-    g_hooks_installed = (hook_count > 0);
-    return g_hooks_installed;
+    g_hooks_installed = TRUE;
+    DBG("All hooks installed via Detours");
+    return TRUE;
+}
+
+static void remove_all_hooks(void) {
+    if (!g_hooks_installed) return;
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+
+    if (g_orig_NtCreateFile)
+        DetourDetach(reinterpret_cast<PVOID*>(&g_orig_NtCreateFile), hooked_NtCreateFile);
+    if (g_orig_NtOpenFile)
+        DetourDetach(reinterpret_cast<PVOID*>(&g_orig_NtOpenFile), hooked_NtOpenFile);
+    if (g_orig_NtDeleteFile)
+        DetourDetach(reinterpret_cast<PVOID*>(&g_orig_NtDeleteFile), hooked_NtDeleteFile);
+    if (g_orig_NtFsControlFile)
+        DetourDetach(reinterpret_cast<PVOID*>(&g_orig_NtFsControlFile), hooked_NtFsControlFile);
+    if (g_orig_CreateProcessW)
+        DetourDetach(reinterpret_cast<PVOID*>(&g_orig_CreateProcessW), hooked_CreateProcessW);
+    if (g_orig_CreateProcessA)
+        DetourDetach(reinterpret_cast<PVOID*>(&g_orig_CreateProcessA), hooked_CreateProcessA);
+
+    DetourTransactionCommit();
+    g_hooks_installed = FALSE;
+    DBG("All hooks removed via Detours");
 }
 
 /* ===========================================================================
@@ -1191,6 +881,8 @@ static BOOL init_shared_memory(void) {
  * =========================================================================== */
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    (void)lpReserved;
+
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
@@ -1207,6 +899,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         break;
 
     case DLL_PROCESS_DETACH:
+        /* With Detours, we can safely unhook on detach */
+        remove_all_hooks();
+
         /* Cleanup shared memory mapping */
         if (g_shm_view) {
             UnmapViewOfFile(g_shm_view);
@@ -1216,9 +911,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             CloseHandle(g_shm_handle);
             g_shm_handle = NULL;
         }
-        /* Note: we don't unhook on detach because the process is exiting.
-         * Unhooking during DLL_PROCESS_DETACH can cause crashes if other
-         * threads are still executing hooked code. */
         break;
     }
     return TRUE;

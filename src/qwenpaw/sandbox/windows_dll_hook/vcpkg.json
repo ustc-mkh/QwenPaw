@@ -1,0 +1,9 @@
+{
+  "name": "qwenpaw-sandbox-hook",
+  "version-string": "1.0.0",
+  "description": "QwenPaw filesystem sandbox DLL hook",
+  "dependencies": [
+    "detours",
+    "cjson"
+  ]
+}

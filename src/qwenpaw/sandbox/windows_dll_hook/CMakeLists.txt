@@ -1,33 +1,43 @@
 cmake_minimum_required(VERSION 3.16)
-project(QwenPawSandboxHook C)
+project(QwenPawSandboxHook CXX)
 
 # This builds the sandbox_hook.dll for Windows x64
-# Build with: cmake -B build -A x64 && cmake --build build --config Release
+# Build with: cmake -B build -A x64 -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
+#             cmake --build build --config Release
 
-set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Dependencies via vcpkg
+# Detours: vcpkg port does not provide a CMake config, use manual find
+find_path(DETOURS_INCLUDE_DIRS "detours/detours.h")
+find_library(DETOURS_LIBRARY_RELEASE detours PATHS "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib" NO_DEFAULT_PATH)
+find_library(DETOURS_LIBRARY_DEBUG detours PATHS "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/lib" NO_DEFAULT_PATH)
+if(NOT DETOURS_LIBRARY_RELEASE)
+    find_library(DETOURS_LIBRARY_RELEASE detours REQUIRED)
+endif()
+
+# cJSON: provides a proper CMake config via vcpkg
+find_package(cJSON CONFIG REQUIRED)
 
 add_library(sandbox_hook SHARED
-    sandbox_hook.c
+    sandbox_hook.cpp
     sandbox_hook.h
 )
 
-# Link against kernel32 (always available on Windows)
-target_link_libraries(sandbox_hook PRIVATE kernel32)
+target_include_directories(sandbox_hook PRIVATE ${DETOURS_INCLUDE_DIRS})
 
-# No C runtime dependency if possible (smaller DLL, fewer imports)
+target_link_libraries(sandbox_hook PRIVATE
+    $<IF:$<CONFIG:Debug>,${DETOURS_LIBRARY_DEBUG},${DETOURS_LIBRARY_RELEASE}>
+    cjson
+    kernel32
+)
+
 if(MSVC)
-    # Use static CRT to avoid vcruntime DLL dependency
+    # Static CRT to avoid vcruntime DLL dependency in injected DLL
     set_property(TARGET sandbox_hook PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    # /utf-8: treat source as UTF-8 (avoids C4819 on CJK code pages)
-    # /O2: optimize for speed, /GS-: no buffer security check overhead
-    target_compile_options(sandbox_hook PRIVATE /O2 /GS- /utf-8)
-    target_link_options(sandbox_hook PRIVATE /NODEFAULTLIB:msvcrt)
-endif()
-
-if(MINGW)
-    target_compile_options(sandbox_hook PRIVATE -O2 -Wall)
-    target_link_options(sandbox_hook PRIVATE -static-libgcc -s)
+    target_compile_options(sandbox_hook PRIVATE /O2 /utf-8)
 endif()
 
 # Output DLL next to Python package

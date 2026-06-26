@@ -443,6 +443,19 @@ def _compile_policy(
     if temp_dir and os.path.isdir(temp_dir):
         rules.append({"path": os.path.normpath(temp_dir), "access": "rw"})
 
+    # 5b. PowerShell profile data directory (writable)
+    # PowerShell writes StartupProfileData-NonInteractive on every launch;
+    # without this rule every sandbox execution reports a spurious violation.
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        ps_profile_dir = os.path.join(
+            local_appdata, "Microsoft", "Windows", "PowerShell"
+        )
+        if os.path.isdir(ps_profile_dir):
+            rules.append(
+                {"path": os.path.normpath(ps_profile_dir), "access": "rw"}
+            )
+
     # 6. Python installation directory (read+execute)
     python_dir = os.path.dirname(sys.executable)
     if python_dir:
