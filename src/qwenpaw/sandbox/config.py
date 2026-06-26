@@ -43,7 +43,7 @@ class SandboxMode(str, Enum):
     SEATBELT = "seatbelt"  # macOS sandbox-exec
     BUBBLEWRAP = "bubblewrap"  # Linux bubblewrap (preferred)
     LANDLOCK = "landlock"  # Linux Landlock LSM (fallback)
-    HOOK = "hook"  # Windows user-mode API hook (DLL injection)
+    WIN_HOOK = "win_hook"  # Windows user-mode API hook (DLL injection)
     NONE = "none"  # No isolation, direct execution
 
 
@@ -310,7 +310,7 @@ def _probe_windows_hook() -> SandboxCapability:
     if available:
         return SandboxCapability(
             supported=True,
-            mode=SandboxMode.HOOK,
+            mode=SandboxMode.WIN_HOOK,
             reason=reason,
         )
     return SandboxCapability(
@@ -462,7 +462,7 @@ def create_sandbox(config: SandboxConfig) -> Any:
         from .linux_sandbox import LinuxSandbox
 
         return LinuxSandbox(config)
-    elif config.mode == SandboxMode.WSL2:
+    elif config.mode == SandboxMode.WIN_HOOK:
         from .windows_sandbox import WindowsSandbox
 
         return WindowsSandbox(config)

@@ -644,12 +644,20 @@ def _parse_ring_buffer(
         fields = struct.unpack(fmt, bytes(entry_header))
 
         if check_commit:
-            # V2 format: total_size, commit, timestamp, pid, tid, path_length, access_type
-            total_size, commit, _ts, pid, _tid, path_length, access_type = (
-                fields
-            )
+            # V2 format: total_size, commit, timestamp, pid,
+            # tid, path_length, access_type
+            (
+                total_size,
+                commit,
+                _ts,
+                pid,
+                _tid,
+                path_length,
+                access_type,
+            ) = fields
         else:
-            # V1 format: total_size, timestamp, pid, tid, path_length, access_type
+            # V1 format: total_size, timestamp, pid, tid,
+            # path_length, access_type
             total_size, _ts, pid, _tid, path_length, access_type = fields
             commit = _VIOLATION_COMMIT_MAGIC  # Treat all as committed
 
@@ -811,7 +819,36 @@ def _create_pipes() -> Tuple[ctypes.c_void_p, ctypes.c_void_p]:
     return read_h, write_h
 
 
-def _read_pipe(  # pylint: disable=too-many-branches
+def _try_decode_utf16le(raw: bytes) -> Optional[str]:
+    """Try to decode raw bytes as UTF-16LE using BOM and heuristic
+    detection."""
+    if len(raw) < 2:
+        return None
+
+    # Check for UTF-16LE BOM
+    if raw[:2] == b"\xff\xfe":
+        try:
+            return raw.decode("utf-16-le")
+        except (UnicodeDecodeError, ValueError):
+            return None
+
+    # Heuristic: if >25% of bytes at odd positions are \x00, it's UTF-16LE
+    if len(raw) >= 4:
+        sample = raw[: min(64, len(raw))]
+        null_at_odd = sum(
+            1 for i in range(1, len(sample), 2) if sample[i] == 0
+        )
+        total_odd = len(sample) // 2
+        if total_odd > 0 and null_at_odd > total_odd * 0.25:
+            try:
+                return raw.decode("utf-16-le")
+            except (UnicodeDecodeError, ValueError):
+                pass
+
+    return None
+
+
+def _read_pipe(
     handle: ctypes.c_void_p,
 ) -> str:
     """Read all available data from a pipe handle until EOF.
@@ -862,27 +899,10 @@ def _read_pipe(  # pylint: disable=too-many-branches
 
     raw = b"".join(chunks)
 
-    # Detect UTF-16LE: if data has frequent \x00 bytes at odd positions,
-    # it's likely UTF-16LE (PowerShell outputs UTF-16LE in some configurations)
-    if len(raw) >= 2:
-        # Check for UTF-16LE BOM
-        if raw[:2] == b"\xff\xfe":
-            try:
-                return raw.decode("utf-16-le")
-            except (UnicodeDecodeError, ValueError):
-                pass
-        # Heuristic: if >25% of bytes at odd positions are \x00, it's UTF-16LE
-        elif len(raw) >= 4:
-            sample = raw[: min(64, len(raw))]
-            null_at_odd = sum(
-                1 for i in range(1, len(sample), 2) if sample[i] == 0
-            )
-            total_odd = len(sample) // 2
-            if total_odd > 0 and null_at_odd > total_odd * 0.25:
-                try:
-                    return raw.decode("utf-16-le")
-                except (UnicodeDecodeError, ValueError):
-                    pass
+    # Try UTF-16LE detection (BOM and heuristic)
+    result = _try_decode_utf16le(raw)
+    if result is not None:
+        return result
 
     for enc in (
         _get_system_oem_encoding(),
@@ -1125,7 +1145,65 @@ def _inject_dll(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _launch_sandboxed_process_sync(  # pylint: disable=too-many-statements
+def _build_env_block(
+    session_id: str,
+    dll_path: str,
+    env_vars: Optional[Dict[str, str]],
+) -> ctypes.Array:
+    """Build a Unicode environment block for the sandboxed child process."""
+    merged = dict(os.environ)
+    if env_vars:
+        merged.update(env_vars)
+    merged[SANDBOX_ENV_VAR] = session_id
+    merged[SANDBOX_DLL_PATH_VAR] = dll_path
+    if logger.isEnabledFor(logging.DEBUG):
+        merged["QWENPAW_HOOK_DEBUG"] = "1"
+    pairs = [f"{k}={v}" for k, v in merged.items()]
+    block_str = "\0".join(pairs) + "\0\0"
+    return ctypes.create_unicode_buffer(block_str)
+
+
+def _create_suspended_process(
+    cmd_line: str,
+    cwd: str,
+    env_block: ctypes.Array,
+    stdout_wr: ctypes.c_void_p,
+    stderr_wr: ctypes.c_void_p,
+) -> PROCESS_INFORMATION:
+    """Create a process in SUSPENDED state with the given pipes and env."""
+    si = STARTUPINFOW()
+    si.cb = ctypes.sizeof(si)
+    si.dwFlags = STARTF_USESTDHANDLES
+    si.hStdInput = _kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+    si.hStdOutput = stdout_wr
+    si.hStdError = stderr_wr
+
+    pi = PROCESS_INFORMATION()
+    creation_flags = (
+        CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
+    )
+
+    ok = _kernel32.CreateProcessW(
+        None,
+        cmd_line,
+        None,
+        None,
+        1,  # bInheritHandles = TRUE
+        creation_flags,
+        ctypes.cast(env_block, ctypes.c_void_p),
+        cwd,
+        ctypes.byref(si),
+        ctypes.byref(pi),
+    )
+    if not ok:
+        err = ctypes.get_last_error()
+        raise OSError(
+            f"CreateProcessW failed: error={err} ({ctypes.FormatError(err)})",
+        )
+    return pi
+
+
+def _launch_sandboxed_process_sync(
     cmd: str,
     cwd: str,
     session_id: str,
@@ -1165,64 +1243,24 @@ def _launch_sandboxed_process_sync(  # pylint: disable=too-many-statements
     Raises:
         OSError: If ``CreateProcessW`` or DLL injection fails.
     """
-    # 1. Create pipes for stdout/stderr capture
     stdout_rd, stdout_wr = _create_pipes()
     stderr_rd, stderr_wr = _create_pipes()
 
     try:
-        # 2. Build environment block (inject session ID and DLL path)
-        merged = dict(os.environ)
-        if env_vars:
-            merged.update(env_vars)
-        merged[SANDBOX_ENV_VAR] = session_id
-        merged[SANDBOX_DLL_PATH_VAR] = dll_path
-        # Enable debug logging in DLL if parent has DEBUG level
-        if logger.isEnabledFor(logging.DEBUG):
-            merged["QWENPAW_HOOK_DEBUG"] = "1"
-        pairs = [f"{k}={v}" for k, v in merged.items()]
-        block_str = "\0".join(pairs) + "\0\0"
-        env_block = ctypes.create_unicode_buffer(block_str)
-
-        # 3. Build command line (wrap in cmd.exe for shell execution)
+        env_block = _build_env_block(session_id, dll_path, env_vars)
         cmd_line = _build_powershell_command_line(cmd, cwd)
 
-        # 4. Fill STARTUPINFOW
-        si = STARTUPINFOW()
-        si.cb = ctypes.sizeof(si)
-        si.dwFlags = STARTF_USESTDHANDLES
-        si.hStdInput = _kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
-        si.hStdOutput = stdout_wr
-        si.hStdError = stderr_wr
-
-        # 5. CreateProcessW in SUSPENDED state
-        pi = PROCESS_INFORMATION()
-        creation_flags = (
-            CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
-        )
-
-        ok = _kernel32.CreateProcessW(
-            None,
+        pi = _create_suspended_process(
             cmd_line,
-            None,
-            None,
-            1,  # bInheritHandles = TRUE
-            creation_flags,
-            ctypes.cast(env_block, ctypes.c_void_p),
             cwd,
-            ctypes.byref(si),
-            ctypes.byref(pi),
+            env_block,
+            stdout_wr,
+            stderr_wr,
         )
-        if not ok:
-            err = ctypes.get_last_error()
-            raise OSError(
-                f"CreateProcessW failed: error={err} "
-                f"({ctypes.FormatError(err)})",
-            )
 
-        # 6. Inject DLL into the suspended process
+        # Inject DLL into the suspended process
         injection_ok = _inject_dll(pi.hProcess, dll_path)
         if not injection_ok:
-            # Terminate the process — running without sandbox is unsafe
             logger.error(
                 "DLL injection failed, terminating unsandboxed process",
             )
@@ -1234,16 +1272,16 @@ def _launch_sandboxed_process_sync(  # pylint: disable=too-many-statements
                 "Cannot execute command without isolation.",
             )
 
-        # 7. Resume the main thread
+        # Resume the main thread (hooks are now active)
         _kernel32.ResumeThread(pi.hThread)
 
-        # 8. Close child-side write handles
+        # Close child-side write handles
         _kernel32.CloseHandle(stdout_wr)
         stdout_wr = None
         _kernel32.CloseHandle(stderr_wr)
         stderr_wr = None
 
-        # 9. Read pipes concurrently (avoids deadlock when both buffers fill)
+        # Read pipes concurrently (avoids deadlock when both buffers fill)
         stdout_data = ""
         stderr_data = ""
 
@@ -1260,21 +1298,18 @@ def _launch_sandboxed_process_sync(  # pylint: disable=too-many-statements
         reader_stdout.start()
         reader_stderr.start()
 
-        # 10. Wait for process completion
+        # Wait for process completion
         wait_result = _kernel32.WaitForSingleObject(pi.hProcess, timeout_ms)
         timed_out = wait_result == WAIT_TIMEOUT
         if timed_out:
             _kernel32.TerminateProcess(pi.hProcess, 1)
 
-        # Wait for readers to finish (pipes close after process exits)
         reader_stdout.join(timeout=5)
         reader_stderr.join(timeout=5)
 
-        # 11. Get exit code
+        # Get exit code and cleanup
         exit_code = ctypes.c_uint32()
         _kernel32.GetExitCodeProcess(pi.hProcess, ctypes.byref(exit_code))
-
-        # 12. Cleanup handles
         _kernel32.CloseHandle(pi.hProcess)
         _kernel32.CloseHandle(pi.hThread)
 

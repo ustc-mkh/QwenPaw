@@ -76,7 +76,7 @@ class TestCompilePolicy:
 
     def test_basic_workspace_rule(self):
         config = SandboxConfig(
-            mode=SandboxMode.HOOK,
+            mode=SandboxMode.WIN_HOOK,
             workspace_dir="C:\\Users\\foo\\project",
             mounts=[MountSpec(path="C:\\Users\\foo\\project", writable=True)],
         )
@@ -96,7 +96,7 @@ class TestCompilePolicy:
 
     def test_deny_paths_have_highest_priority(self):
         config = SandboxConfig(
-            mode=SandboxMode.HOOK,
+            mode=SandboxMode.WIN_HOOK,
             workspace_dir="C:\\Users\\foo\\project",
             mounts=[MountSpec(path="C:\\Users\\foo\\project", writable=True)],
             deny_paths=["C:\\Users\\foo\\.ssh", "C:\\Users\\foo\\.aws"],
@@ -112,7 +112,7 @@ class TestCompilePolicy:
 
     def test_readonly_mount(self):
         config = SandboxConfig(
-            mode=SandboxMode.HOOK,
+            mode=SandboxMode.WIN_HOOK,
             workspace_dir="C:\\Users\\foo\\project",
             mounts=[
                 MountSpec(path="C:\\Users\\foo\\project", writable=True),
@@ -132,7 +132,7 @@ class TestCompilePolicy:
 
     def test_executable_false(self):
         config = SandboxConfig(
-            mode=SandboxMode.HOOK,
+            mode=SandboxMode.WIN_HOOK,
             workspace_dir="C:\\Users\\foo\\project",
             mounts=[
                 MountSpec(path="C:\\Users\\foo\\project", writable=True),
@@ -163,7 +163,7 @@ class TestWindowsSandboxExecution:
 
     def _make_config(self):
         return SandboxConfig(
-            mode=SandboxMode.HOOK,
+            mode=SandboxMode.WIN_HOOK,
             workspace_dir="C:\\Users\\foo\\project",
             mounts=[MountSpec(path="C:\\Users\\foo\\project", writable=True)],
             deny_paths=["~\\.ssh"],

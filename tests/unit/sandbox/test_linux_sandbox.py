@@ -78,12 +78,12 @@ class TestProbeSandboxSupport:
         # When the hook probe succeeds, probe_sandbox_support returns HOOK.
         mock_probe.return_value = SandboxCapability(
             supported=True,
-            mode=SandboxMode.HOOK,
+            mode=SandboxMode.WIN_HOOK,
             reason="Windows DLL injection sandbox available",
         )
         result = probe_sandbox_support()
         assert result.supported is True
-        assert result.mode == SandboxMode.HOOK
+        assert result.mode == SandboxMode.WIN_HOOK
         mock_probe.assert_called_once()
 
     @patch("sys.platform", "freebsd13")
