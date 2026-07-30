@@ -900,8 +900,13 @@ _ACL_DENY_ALL = _ACL_FULL_ACCESS | _WC.GENERIC_ALL
 _ACL_TRAVERSE = 0x00120021
 
 
-def _add_traverse_ace(path: str, psid: ctypes.c_void_p) -> bool:
-    """Adds a non-inheritable traverse ACE on a directory using NtSetSecurityObject.
+def _add_traverse_ace(  # pylint: disable=too-many-return-statements
+    path: str,
+    psid: ctypes.c_void_p,
+) -> bool:
+    """Adds a non-inheritable traverse ACE on a directory.
+
+    Uses NtSetSecurityObject.
 
     Uses the NT native API to directly write the modified DACL, bypassing
     the Win32 layer's expensive recursive inheritance propagation.  This is
@@ -986,7 +991,7 @@ def _add_traverse_ace(path: str, psid: ctypes.c_void_p) -> bool:
                 return False
 
             try:
-                # Build self-relative security descriptor for NtSetSecurityObject
+                # Build self-relative SD for NtSetSecurityObject
                 _SECURITY_DESCRIPTOR_REVISION = 1
                 sd_size = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 20
                 sd_abs = (ctypes.c_ubyte * sd_size)()
@@ -1009,7 +1014,8 @@ def _add_traverse_ace(path: str, psid: ctypes.c_void_p) -> bool:
                 )
                 if sr_size.value == 0:
                     logger.warning(
-                        "_add_traverse_ace: MakeSelfRelativeSD size query failed",
+                        "_add_traverse_ace: "
+                        "MakeSelfRelativeSD size query failed",
                     )
                     return False
 
@@ -1050,8 +1056,13 @@ def _add_traverse_ace(path: str, psid: ctypes.c_void_p) -> bool:
         kernel32.CloseHandle(h_dir)
 
 
-def _remove_traverse_ace(path: str, sid_string: str) -> bool:
-    """Removes traverse ACEs for a SID from a directory using NtSetSecurityObject.
+def _remove_traverse_ace(  # pylint: disable=R0911,R0912,R0915
+    path: str,
+    sid_string: str,
+) -> bool:
+    """Removes traverse ACEs for a SID from a directory.
+
+    Uses NtSetSecurityObject.
 
     Uses the NT native API to write the modified DACL directly, avoiding
     the expensive recursive inheritance propagation triggered by
@@ -1145,9 +1156,12 @@ def _remove_traverse_ace(path: str, sid_string: str) -> bool:
                     ace_ptr = ctypes.c_void_p()
                     if not advapi32.GetAce(p_dacl, i, ctypes.byref(ace_ptr)):
                         continue
+                    if ace_ptr.value is None:
+                        continue
                     sid_ptr = ctypes.c_void_p(ace_ptr.value + 8)
                     if advapi32.IsValidSid(sid_ptr) and advapi32.EqualSid(
-                        sid_ptr, psid_target
+                        sid_ptr,
+                        psid_target,
                     ):
                         to_delete.append(i)
 
@@ -1197,7 +1211,8 @@ def _remove_traverse_ace(path: str, sid_string: str) -> bool:
                 )
                 if status != 0:
                     logger.warning(
-                        "_remove_traverse_ace: NtSetSecurityObject(%s) failed: "
+                        "_remove_traverse_ace: "
+                        "NtSetSecurityObject(%s) failed: "
                         "NTSTATUS=0x%08X",
                         path,
                         status & 0xFFFFFFFF,
@@ -1508,7 +1523,7 @@ def _ensure_workspace_traverse_acls(
     workspace_dir: str,
     user_psid: ctypes.c_void_p,
 ) -> List[_AclEntry]:
-    """Grants traverse ACEs on all parent dirs from drive root to workspace_dir.
+    """Grants traverse ACEs on parent dirs up to workspace_dir.
 
     Uses NtSetSecurityObject which completes in <1ms per directory regardless
     of child count.  Since the overhead is negligible, we unconditionally set
