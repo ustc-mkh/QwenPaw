@@ -4,31 +4,30 @@
 Run on Windows:
     python scripts/cleanup_windows_sandbox.py
 
-Administrator privileges are required for elevated sandbox cleanup (user
-accounts, firewall rules, profile directories).  Unelevated and AppContainer
-sandbox cleanup works without admin.
+Administrator privileges are required for AppContainer and elevated sandbox
+cleanup. Unelevated sandbox cleanup works without admin.
 
 This script performs cleanup for all three sandbox backends:
 
-  A. AppContainer sandboxes (no admin required):
-     For each metadata file in ~/.qwenpaw/containers/*.json:
-        1. Removes ACLs (Win32 API) from paths in acl_manifest
-        2. Deletes the AppContainer profile via userenv.dll
-        3. Deletes the metadata JSON file
+  A. AppContainer sandboxes (allow_read_all=False, requires admin):
+     For each container metadata file in ~/.qwenpaw/containers/*.json:
+        1. Removes ACLs (icacls /remove) from known paths
+        2. Removes the associated NTFS junction
+        3. Deletes the AppContainer profile via userenv.dll
+        4. Deletes the metadata JSON file
 
-  B. Elevated sandboxes (requires admin):
-     For each metadata file in ~/.qwenpaw/sandboxes/*.json:
-        1. Removes ACLs for cap_sid and user_sid from acl_entries
-           - Regular ACEs via Win32 SetNamedSecurityInfoW
-           - Traverse ACEs via NtSetSecurityObject (O(1))
-        2. Removes Windows Firewall block rules (netsh)
-        3. Deletes the local user account (net user /delete)
-        4. Removes the user profile directory (reg unload + rd /s /q)
-        5. Deletes the metadata JSON file
+  B. Restricted-token sandboxes (allow_read_all=True, requires admin):
+     For each sandbox metadata file in ~/.qwenpaw/sandboxes/*.json:
+        1. Removes ACLs for capability SID and user SID from recorded paths
+        2. Verifies ACL removal succeeded (re-checks each path)
+        3. Removes Windows Firewall block rules for the sandbox user
+        4. Deletes the local user account
+        5. Removes the user's profile directory
+        6. Deletes the metadata JSON file
 
   C. Unelevated sandboxes (no admin required):
      For each metadata file in ~/.qwenpaw/unelevated_sandboxes/*.json:
-        1. Removes ACLs for cap_sid via Win32 API
+        1. Removes ACLs for capability SID with verification
         2. Deletes the metadata JSON file
      Also migrates the legacy single state file if present.
 
@@ -766,48 +765,105 @@ def _cleanup_sandbox_group() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Orchestration
+# Unelevated sandbox cleanup (no admin required)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _count_json(directory: Path) -> int:
-    """Count *.json files in a directory (0 if doesn't exist)."""
-    if directory.is_dir():
-        return len(list(directory.glob("*.json")))
-    return 0
+def _cleanup_single_unelevated_sandbox(meta_file: Path) -> None:
+    """Clean up a single unelevated sandbox (no admin required).
+
+    Steps:
+        1. Remove ACLs for capability SID (with verification)
+        2. Delete the metadata JSON file
+    """
+    try:
+        with open(meta_file, "r", encoding="utf-8") as fp:
+            meta = json.load(fp)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"\n  WARNING: Cannot read {meta_file.name}: {e}")
+        print("    Removing invalid metadata file.")
+        try:
+            meta_file.unlink()
+        except OSError:
+            pass
+        return
+
+    sandbox_id = meta.get("sandbox_id", "")
+    cap_sid = meta.get("cap_sid", "")
+    acl_entries = meta.get("acl_entries", [])
+
+    print(f"\n  Unelevated Sandbox: {sandbox_id}")
+    print(f"    Cap SID:  {cap_sid}")
+
+    # Step 1: Remove ACL entries with verification
+    verify_failures = 0
+    verify_successes = 0
+    if acl_entries and cap_sid:
+        print(f"    Removing {len(acl_entries)} ACL entries...")
+        for entry in acl_entries:
+            entry_path = entry.get("path", "")
+            if not entry_path or not os.path.exists(entry_path):
+                continue
+            ok = _remove_acl_with_verify(entry_path, cap_sid, "capability")
+            if ok:
+                verify_successes += 1
+            else:
+                verify_failures += 1
+        print(
+            f"    ACL cleanup: {verify_successes} succeeded, "
+            f"{verify_failures} failed",
+        )
+
+    # Step 2: Delete the metadata JSON file
+    try:
+        meta_file.unlink()
+        print(f"    Deleted metadata: {meta_file.name}")
+    except OSError as e:
+        print(f"    WARNING: Failed to delete {meta_file.name}: {e}")
 
 
-def _confirm_cleanup(
-    is_admin: bool,
-    appcontainer_count: int,
-    elevated_count: int,
-    unelevated_count: int,
-) -> None:
-    """Print summary and prompt user for confirmation."""
-    print("=" * 60)
-    print("WARNING: This will clean up ALL QwenPaw sandboxes,")
-    print("including any that are currently RUNNING.")
-    print()
-    print(f"  AppContainer sandboxes:    {appcontainer_count}")
-    print(f"  Elevated sandboxes:        {elevated_count}")
-    print(f"  Unelevated sandboxes:      {unelevated_count}")
-    if not is_admin and elevated_count:
-        print()
-        print(
-            "  NOTE: Not running as administrator. Elevated sandbox",
-        )
-        print(
-            "  cleanup will be SKIPPED (user accounts, firewall, profiles).",
-        )
-    print()
-    print("The following actions will be performed:")
-    print("  - Remove filesystem ACLs set by sandboxes (Win32 API)")
-    if is_admin:
-        print("  - Delete AppContainer profiles")
-        print("  - Delete local sandbox user accounts (qwenpaw_*)")
-        print("  - Remove firewall block rules")
-        print("  - Remove user profile directories")
-        print("  - Remove QwenpawUsers group (if empty)")
+def _cleanup_legacy_unelevated_state(state_dir: Path) -> None:
+    """Removes the legacy single unelevated sandbox state file."""
+    legacy_file = state_dir / "unelevated_sandbox_state.json"
+    if not legacy_file.exists():
+        return
+    print("    Migrating legacy unelevated sandbox state file...")
+    try:
+        with open(legacy_file, "r", encoding="utf-8") as fp:
+            state = json.load(fp)
+        cap_sid = state.get("cap_sid", "")
+        if cap_sid:
+            all_paths = state.get("acl_paths", []) + state.get(
+                "deny_paths",
+                [],
+            )
+            for path in all_paths:
+                if os.path.exists(path):
+                    _remove_acl_with_verify(path, cap_sid, "capability")
+        legacy_file.unlink(missing_ok=True)
+        print("    Legacy state file migrated and removed.")
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"    WARNING: Failed to migrate legacy state: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Common cleanup helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _cleanup_remaining_junctions(state_dir: Path) -> None:
+    """Remove any remaining NTFS junctions not tied to a metadata file."""
+    junctions_dir = state_dir / "junctions"
+    print(f"\n[4] Removing remaining NTFS junctions from: {junctions_dir}")
+    if junctions_dir.is_dir():
+        count = 0
+        for entry in junctions_dir.iterdir():
+            if entry.is_dir():
+                if _remove_junction(str(entry)):
+                    count += 1
+                else:
+                    print(f"    WARNING: Failed to remove junction: {entry}")
+        print(f"    Removed {count} junction(s).")
     else:
         print("  - Delete AppContainer profiles")
     print("  - Delete sandbox metadata files")
@@ -822,11 +878,27 @@ def _confirm_cleanup(
     print()
 
 
-def _cleanup_state_dirs(state_dir: Path, *, is_admin: bool) -> None:
-    """Remove empty state directories after cleanup."""
-    unelevated_dir = state_dir / "unelevated_sandboxes"
+def _cleanup_state_dirs(state_dir: Path) -> None:
+    """Remove state directories and clean up."""
+    print("\n[5] Removing state directories...")
+    junctions_dir = state_dir / "junctions"
     containers_dir = state_dir / "containers"
     sandboxes_dir = state_dir / "sandboxes"
+    unelevated_dir = state_dir / "unelevated_sandboxes"
+    for d in [containers_dir, sandboxes_dir, unelevated_dir, junctions_dir]:
+        if d.is_dir():
+            try:
+                shutil.rmtree(str(d))
+                print(f"    Removed: {d}")
+            except OSError as e:
+                print(f"    WARNING: Failed to remove {d}: {e}")
+        elif d.exists():
+            # Handle case where path exists but isn't a directory
+            try:
+                d.unlink()
+                print(f"    Removed file: {d}")
+            except OSError as e:
+                print(f"    WARNING: Failed to remove {d}: {e}")
 
     dirs_to_check = [unelevated_dir, containers_dir]
     if is_admin:
@@ -856,7 +928,111 @@ def _cleanup_state_dirs(state_dir: Path, *, is_admin: bool) -> None:
             )
 
 
-def main() -> None:  # pylint: disable=R0912,R0915
+def _count_metadata_files(directory: Path) -> int:
+    """Count *.json files in a directory (0 if directory doesn't exist)."""
+    if directory.is_dir():
+        return len(list(directory.glob("*.json")))
+    return 0
+
+
+def _confirm_cleanup(
+    is_admin: bool,
+    appcontainer_count: int,
+    restricted_count: int,
+    unelevated_count: int,
+) -> None:
+    """Print summary and prompt user for confirmation. Exits on decline."""
+    print("=" * 60)
+    print("WARNING: This will clean up ALL QwenPaw sandboxes,")
+    print("including any that are currently RUNNING.")
+    print()
+    print(f"  AppContainer sandboxes found:       {appcontainer_count}")
+    print(f"  Restricted-token sandboxes found:   {restricted_count}")
+    print(f"  Unelevated sandboxes found:         {unelevated_count}")
+    if not is_admin and (appcontainer_count or restricted_count):
+        print()
+        print(
+            "  NOTE: Not running as administrator. AppContainer and",
+        )
+        print(
+            "  restricted-token sandbox cleanup will be SKIPPED.",
+        )
+    print()
+    print("The following actions will be performed:")
+    print("  - Remove filesystem ACLs set by sandboxes")
+    if is_admin:
+        print("  - Delete AppContainer profiles")
+        print("  - Delete local sandbox user accounts (qwenpaw_*)")
+        print("  - Remove firewall block rules")
+        print("  - Remove user profile directories")
+    print("  - Delete sandbox metadata files")
+    print()
+    print("Please make sure no sandbox is currently in use before proceeding.")
+    print("=" * 60)
+    print()
+    choice = input("Do you want to continue? (Y/N): ").strip().upper()
+    if choice != "Y":
+        print("Aborted by user.")
+        sys.exit(0)
+    print()
+
+
+def _run_appcontainer_cleanup(
+    containers_dir: Path,
+    state_dir: Path,
+    fallback_global_paths: List[str],
+) -> None:
+    """Step 1: Process AppContainer sandboxes."""
+    if containers_dir.is_dir():
+        json_files = sorted(containers_dir.glob("*.json"))
+        print(f"[1] Found {len(json_files)} AppContainer metadata file(s).")
+        for meta_file in json_files:
+            _cleanup_single_container(
+                meta_file,
+                state_dir,
+                fallback_global_paths,
+            )
+    else:
+        if elevated_count:
+            print("    SKIPPED (requires administrator privileges)")
+        else:
+            print("    Nothing to clean.")
+
+
+def _run_restricted_cleanup(sandboxes_dir: Path) -> None:
+    """Step 2: Process restricted-token sandboxes."""
+    if sandboxes_dir.is_dir():
+        json_files = sorted(sandboxes_dir.glob("*.json"))
+        print(
+            f"\n[2] Found {len(json_files)} "
+            f"restricted-token sandbox metadata file(s).",
+        )
+        for meta_file in json_files:
+            _cleanup_single_restricted_sandbox(meta_file)
+        _cleanup_sandbox_group()
+    else:
+        print("\n[2] No restricted-token sandbox metadata directory found.")
+
+
+def _run_unelevated_cleanup(
+    unelevated_dir: Path,
+    state_dir: Path,
+) -> None:
+    """Step 3: Process unelevated sandboxes (no admin required)."""
+    _cleanup_legacy_unelevated_state(state_dir)
+    if unelevated_dir.is_dir():
+        json_files = sorted(unelevated_dir.glob("*.json"))
+        print(
+            f"\n[3] Found {len(json_files)} "
+            f"unelevated sandbox metadata file(s).",
+        )
+        for meta_file in json_files:
+            _cleanup_single_unelevated_sandbox(meta_file)
+    else:
+        print("\n[3] No unelevated sandbox metadata directory found.")
+
+
+def main() -> None:
     if sys.platform != "win32":
         print("ERROR: This script must run on Windows.")
         sys.exit(1)
@@ -868,21 +1044,14 @@ def main() -> None:  # pylint: disable=R0912,R0915
     sandboxes_dir = state_dir / "sandboxes"
     unelevated_dir = state_dir / "unelevated_sandboxes"
 
-    appcontainer_count = _count_json(containers_dir)
-    elevated_count = _count_json(sandboxes_dir)
-    unelevated_count = _count_json(unelevated_dir)
-
-    if not appcontainer_count and not elevated_count and not unelevated_count:
-        # Check for legacy state file
-        legacy = state_dir / "unelevated_sandbox_state.json"
-        if not legacy.exists():
-            print("No QwenPaw sandbox metadata found. Nothing to clean up.")
-            sys.exit(0)
+    appcontainer_count = _count_metadata_files(containers_dir)
+    restricted_count = _count_metadata_files(sandboxes_dir)
+    unelevated_count = _count_metadata_files(unelevated_dir)
 
     _confirm_cleanup(
         is_admin,
         appcontainer_count,
-        elevated_count,
+        restricted_count,
         unelevated_count,
     )
 
@@ -891,46 +1060,31 @@ def main() -> None:  # pylint: disable=R0912,R0915
     print("=" * 60)
     print(f"  State directory: {state_dir}")
     if not is_admin:
-        print("  Running without admin — elevated sandbox cleanup skipped")
+        print("  Running without admin — only unelevated cleanup available")
     print()
 
-    # Step 1: AppContainer sandboxes (no admin required)
-    print(f"[1] AppContainer sandboxes ({appcontainer_count} found)")
-    if containers_dir.is_dir():
-        for meta_file in sorted(containers_dir.glob("*.json")):
-            _cleanup_single_container(meta_file)
-    if not appcontainer_count:
-        print("    Nothing to clean.")
+    sys_drive = os.environ.get("SystemDrive", "C:")
+    fallback_global_paths = [
+        sys_drive + "\\",
+        sys_drive + "\\Users",
+        os.environ.get("USERPROFILE", ""),
+        os.path.dirname(sys.executable),
+    ]
 
-    # Step 2: Elevated sandboxes (admin required)
-    print(f"\n[2] Elevated sandboxes ({elevated_count} found)")
     if is_admin:
-        if sandboxes_dir.is_dir():
-            for meta_file in sorted(sandboxes_dir.glob("*.json")):
-                _cleanup_single_elevated_sandbox(meta_file)
-        if not elevated_count:
-            print("    Nothing to clean.")
-        # Clean up QwenpawUsers group after all elevated sandboxes are removed
-        if elevated_count > 0:
-            _cleanup_sandbox_group()
+        _run_appcontainer_cleanup(
+            containers_dir,
+            state_dir,
+            fallback_global_paths,
+        )
+        _run_restricted_cleanup(sandboxes_dir)
     else:
-        if elevated_count:
-            print("    SKIPPED (requires administrator privileges)")
-        else:
-            print("    Nothing to clean.")
+        print("[1] Skipped AppContainer cleanup (requires admin).")
+        print("\n[2] Skipped restricted-token cleanup (requires admin).")
 
-    # Step 3: Unelevated sandboxes (no admin required)
-    print(f"\n[3] Unelevated sandboxes ({unelevated_count} found)")
-    _migrate_legacy_state_file(state_dir)
-    if unelevated_dir.is_dir():
-        for meta_file in sorted(unelevated_dir.glob("*.json")):
-            _cleanup_single_unelevated_sandbox(meta_file)
-    if not unelevated_count:
-        print("    Nothing to clean.")
-
-    # Step 4: Clean up empty directories
-    print("\n[4] Cleaning up state directories...")
-    _cleanup_state_dirs(state_dir, is_admin=is_admin)
+    _run_unelevated_cleanup(unelevated_dir, state_dir)
+    _cleanup_remaining_junctions(state_dir)
+    _cleanup_state_dirs(state_dir)
 
     print("\n" + "=" * 60)
     print("Cleanup complete.")
